@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# 虚拟环境
+venv/
+env/
+.venv/
+
+# Streamlit Secrets（含 API Key，禁止提交）
+.streamlit/secrets.toml
+.streamlit/credentials.toml
+
+# WorkBuddy 工作目录（本地数据，不提交）
+.workbuddy/
+
+# 本地 AI 配置（含 API Key）
+.lottery_ai/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 日志
+*.log
+
+# 临时文件
+*.tmp
+*.bak
+DEPLOY.md
