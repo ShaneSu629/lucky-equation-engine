@@ -289,13 +289,26 @@ def bayesian_fusion_scores(freq_weights: Dict[int, float],
                             w_freq: float = 0.25,
                             w_decay: float = 0.25,
                             w_missing: float = 0.25,
-                            w_markov: float = 0.25) -> Dict[int, float]:
+                            w_markov: float = 0.25,
+                            zone_heat: Dict[int, float] = None,
+                            w_zone: float = 0.0) -> Dict[int, float]:
     """
     贝叶斯融合：在概率空间中对多个信号进行加权融合
-    score = exp(w1*log(freq) + w2*log(decay) + w3*log(bounce+smooth) + w4*log(markov+smooth))
-    然后归一化
+    score = exp(Σ w_i * log(signal_i + smooth))，权重自动归一化
+    新增 zone_heat（区间轮动热度）信号：偏好当前活跃区间号码
     """
     EPSILON = 1e-8
+    # 权重自动归一化，避免新增信号时打乱原有比例
+    wsum = w_freq + w_decay + w_missing + w_markov + w_zone
+    if wsum <= 0:
+        w_freq, w_decay, w_missing, w_markov, w_zone = 0.25, 0.25, 0.25, 0.25, 0.0
+        wsum = 1.0
+    w_freq /= wsum
+    w_decay /= wsum
+    w_missing /= wsum
+    w_markov /= wsum
+    w_zone /= wsum
+
     scores = {}
 
     for num in population:
@@ -303,21 +316,72 @@ def bayesian_fusion_scores(freq_weights: Dict[int, float],
         d = decay_weights.get(num, EPSILON)
         m = missing_analysis.get(num, {}).get("bounce_prob", 0.0) + EPSILON
         k = markov_probs.get(num, EPSILON)
+        z = zone_heat.get(num, EPSILON) if zone_heat else EPSILON
 
-        # 对数空间融合
         log_score = (w_freq * math.log(max(f, EPSILON)) +
                      w_decay * math.log(max(d, EPSILON)) +
                      w_missing * math.log(max(m, EPSILON)) +
-                     w_markov * math.log(max(k, EPSILON)))
+                     w_markov * math.log(max(k, EPSILON)) +
+                     w_zone * math.log(max(z, EPSILON)))
         scores[num] = math.exp(log_score)
 
-    # 归一化
     total = sum(scores.values())
     if total > 0:
         for k in scores:
             scores[k] /= total
 
     return scores
+
+
+def _zone_ranges_for(lottery_type: str):
+    """返回该彩种的分区区间（含端点），用于区间轮动热度分析。"""
+    if lottery_type == "ssq":
+        return [(1, 11), (12, 22), (23, 33)]
+    elif lottery_type == "dlt":
+        return [(1, 7), (8, 14), (15, 21), (22, 28), (29, 35)]
+    elif lottery_type == "kl8":
+        return [(1, 20), (21, 40), (41, 60), (61, 80)]
+    return None
+
+
+def calculate_zone_heat(df: pd.DataFrame, cols: List[str],
+                        zone_ranges: List[Tuple[int, int]],
+                        population: List[int],
+                        decay_factor: float = 0.95) -> Dict[int, float]:
+    """
+    区间轮动热度：计算每个号码所属区间的近期加权出现频率，
+    并将该热度摊到区间内每个号码（按区间号码数归一化），
+    使 zone_heat 与单号码频率量级可比。偏好当前活跃区间的号码。
+    """
+    zone_weights = [0.0] * len(zone_ranges)
+    n = len(df)
+
+    for idx, (_, row) in enumerate(df.iterrows()):
+        position_weight = decay_factor ** idx
+        for col in cols:
+            if col in row:
+                val = int(row[col])
+                for zi, (lo, hi) in enumerate(zone_ranges):
+                    if lo <= val <= hi:
+                        zone_weights[zi] += position_weight
+                        break
+
+    zone_heat = {}
+    total = sum(zone_weights)
+    if total > 0:
+        for num in population:
+            for zi, (lo, hi) in enumerate(zone_ranges):
+                if lo <= num <= hi:
+                    norm = zone_weights[zi] / max(1, (hi - lo + 1))
+                    zone_heat[num] = norm
+                    break
+            else:
+                zone_heat[num] = 0.0
+    else:
+        for num in population:
+            zone_heat[num] = 0.0
+
+    return zone_heat
 
 
 # ============================================================================
@@ -376,6 +440,63 @@ def score_combination_ssq(reds: List[int],
     penalty = 0.6 if not valid else 1.0
     penalty *= 0.9 ** len(issues)
     return avg_score * penalty
+
+
+# ============================================================================
+# 第六·五部分：组合统计偏好评分（和值/连号/同尾数/覆盖度）
+# 文献依据：17500 数学模型文、CSDN 智能选号模型——和值区间、连号~30%、
+# 同尾数 2-3 组、区间覆盖，可显著提升组合的"统计合理性"。
+# ============================================================================
+
+def _pref_sum_gaussian(nums: List[int], center: float, width: float) -> float:
+    """和值高斯偏好：越接近历史常见中枢和值，分越高。"""
+    s = sum(nums)
+    diff = (s - center) / width
+    return float(math.exp(-0.5 * diff * diff))
+
+
+def _pref_consecutive(nums: List[int], ideal_low: int = 1, ideal_high: int = 2) -> float:
+    """连号偏好：相邻差=1 的对数量，落在理想区间得满分。"""
+    sorted_n = sorted(nums)
+    consec = sum(1 for i in range(len(sorted_n) - 1)
+                 if sorted_n[i + 1] - sorted_n[i] == 1)
+    if ideal_low <= consec <= ideal_high:
+        return 1.0
+    return max(0.0, 1.0 - 0.3 * abs(consec - (ideal_low + ideal_high) / 2))
+
+
+def _pref_tail_groups(nums: List[int], ideal_min: int = 3, ideal_max: int = 5) -> float:
+    """同尾数偏好：不同尾数的数量，落在理想区间得满分。"""
+    cnt = len(set(n % 10 for n in nums))
+    if ideal_min <= cnt <= ideal_max:
+        return 1.0
+    return max(0.0, 1.0 - 0.25 * abs(cnt - (ideal_min + ideal_max) / 2))
+
+
+def score_combination_preferences(nums: List[int], lottery_type: str) -> float:
+    """
+    组合统计偏好总评分（0~1）。
+    双色球/大乐透前区：和值高斯 + 连号 + 同尾数。
+    快乐8：和值高斯 + 跨度覆盖 + 奇偶均衡。
+    """
+    if lottery_type == "ssq":
+        s = _pref_sum_gaussian(nums, 102, 25)
+        c = _pref_consecutive(nums, 1, 2)
+        t = _pref_tail_groups(nums, 3, 5)
+        return 0.4 * s + 0.3 * c + 0.3 * t
+    elif lottery_type == "dlt":
+        s = _pref_sum_gaussian(nums, 100, 25)
+        c = _pref_consecutive(nums, 1, 2)
+        t = _pref_tail_groups(nums, 3, 5)
+        return 0.4 * s + 0.3 * c + 0.3 * t
+    elif lottery_type == "kl8":
+        s = _pref_sum_gaussian(nums, 405, 70)
+        span = max(nums) - min(nums)
+        span_score = 1.0 if span >= 60 else max(0.0, span / 60)
+        oe = classify_odd_even(nums)
+        oe_score = 1.0 - abs(oe["odd"] - 5) / 5.0
+        return 0.4 * s + 0.3 * span_score + 0.3 * oe_score
+    return 1.0
 
 
 # ============================================================================
@@ -439,16 +560,9 @@ class EnhancedPredictor:
         self._initialized = False
 
     def _load_data(self) -> pd.DataFrame:
-        csv_path = os.path.join(DATA_DIR, f"{self.lottery_type}.csv")
-        if not os.path.exists(csv_path):
-            return pd.DataFrame()
-        encodings = ['utf-8', 'utf-8-sig', 'gbk', 'gb2312']
-        for enc in encodings:
-            try:
-                return pd.read_csv(csv_path, encoding=enc)
-            except (UnicodeDecodeError, UnicodeError):
-                continue
-        return pd.DataFrame()
+        """从数据库加载彩种历史数据。"""
+        from db_manager import read_lottery_data
+        return read_lottery_data(self.lottery_type)
 
     def _get_cols_and_population(self):
         if self.lottery_type == "ssq":
@@ -515,7 +629,13 @@ class EnhancedPredictor:
         self.markov_probs = markov_next_probability(
             self.last_draw_nums, markov_matrix, population)
 
-        # 5. 贝叶斯融合
+        # 5. 贝叶斯融合（含区间轮动热度信号）
+        zone_ranges = _zone_ranges_for(self.lottery_type)
+        zone_heat = None
+        if zone_ranges:
+            zone_heat = calculate_zone_heat(
+                recent, cols, zone_ranges, population, decay_factor=0.95)
+        self.zone_heat = zone_heat
         self.fusion_scores = bayesian_fusion_scores(
             self.freq_weights,
             self.decay_weights,
@@ -523,9 +643,11 @@ class EnhancedPredictor:
             self.markov_probs,
             population,
             w_freq=0.20,
-            w_decay=0.30,
-            w_missing=0.25,
-            w_markov=0.25
+            w_decay=0.28,
+            w_missing=0.24,
+            w_markov=0.24,
+            zone_heat=zone_heat,
+            w_zone=0.04
         )
 
         # 6. 蒙特卡洛
@@ -635,12 +757,20 @@ class EnhancedPredictor:
             if not valid and len(issues) >= 3:
                 continue  # 超过2个问题的组合直接丢弃
 
+            # 统计偏好（和值/连号/同尾数）温和过滤极端不合理组合
+            if score_combination_preferences(reds, "ssq") < 0.35:
+                continue
+
             # 蓝球：按融合概率 + 80%热20%冷
             blue = self._weighted_pick_with_temperature(
                 self.blue_fusion, blue_population, temp=0.3)
 
             used_combinations.add(reds_sorted)
             groups.append((list(reds_sorted), blue))
+
+            # 多样性：与已有组保持最小汉明距离（避免两组几乎相同）
+            if used_combinations and self._hamming_vs_used(reds_sorted, used_combinations) < 2:
+                continue
 
         # 如果生成不够，补随机
         import random
@@ -692,6 +822,10 @@ class EnhancedPredictor:
             if oe["odd"] not in (1, 2, 3, 4):
                 continue
 
+            # 统计偏好（和值/连号/同尾数）温和过滤
+            if score_combination_preferences(fronts, "dlt") < 0.35:
+                continue
+
             # 后区：按融合概率选2个不重复号码
             back1 = self._weighted_pick_with_temperature(
                 self.blue_fusion, back_population, temp=0.3)
@@ -703,6 +837,10 @@ class EnhancedPredictor:
 
             key = (fronts_sorted, tuple(backs))
             if key in used_combinations:
+                continue
+
+            # 多样性：前区与前组保持最小汉明距离
+            if used_combinations and self._hamming_vs_used(fronts_sorted, used_combinations) < 2:
                 continue
 
             used_combinations.add(fronts_sorted)
@@ -838,6 +976,22 @@ class EnhancedPredictor:
 
         return groups
 
+    def _hamming_vs_used(self, candidate_tuple: Tuple, used_set: set,
+                         threshold: int = 2) -> int:
+        """
+        返回候选组合与已选组合集合的最小对称差大小（汉明距离）。
+        小于 threshold 视为过度相似，拒绝以保证组间分散、避免扎堆。
+        """
+        cand = set(candidate_tuple)
+        best = len(cand)
+        for used in used_set:
+            d = len(cand ^ set(used))
+            if d < best:
+                best = d
+            if best <= 1:
+                break
+        return best
+
     def _weighted_sample_balanced(self, scores: Dict[int, float],
                                    population: List[int], k: int,
                                    hot_ratio=0.40, warm_ratio=0.35,
@@ -931,8 +1085,14 @@ class EnhancedPredictor:
             nums = self._weighted_sample_balanced(
                 self.fusion_scores, population, select_count,
                 hot_ratio=0.40, warm_ratio=0.35, cold_ratio=0.25)
+            # 统计偏好（和值/跨度/奇偶）温和过滤
+            if score_combination_preferences(nums, "kl8") < 0.30:
+                continue
             nt = tuple(nums)
             if nt not in used_combinations:
+                # 多样性：组间最小汉明距离（避免选号扎堆）
+                if used_combinations and self._hamming_vs_used(nt, used_combinations) < 3:
+                    continue
                 used_combinations.add(nt)
                 groups.append(nums)
 
@@ -1078,6 +1238,40 @@ class EnhancedPredictor:
         if not self._initialized:
             return {"error": "未初始化"}
 
+        # 位置制彩票（七星彩/排列三/福彩3D）：每位数独立 0-9，号码池小，
+        # 不能走"高频 Top-K 滑动窗口"（最多只能凑出 sample_size 窗口数种组合）。
+        # 直接委托分位独立的 predict_* 方法生成多样组合。
+        if self.lottery_type in ("qxc", "pl3", "fcsd"):
+            if self.lottery_type == "qxc":
+                raw = self.predict_qxc(n_groups)
+            elif self.lottery_type == "pl3":
+                raw = self.predict_pl3(n_groups)
+            else:
+                raw = self.predict_fcsd(n_groups)
+            recommendations = []
+            for grp in raw:
+                nums = list(grp)
+                if self.fusion_scores:
+                    avg_conf = sum(self.fusion_scores.get(n, 0) for n in nums) / len(nums)
+                else:
+                    avg_conf = 0.0
+                recommendations.append({
+                    "nums": nums,
+                    "confidence": round(avg_conf, 4),
+                    "valid": True
+                })
+            return {
+                "lottery_type": self.lottery_type,
+                "confidence_distribution": {},
+                "recommendations": recommendations,
+                "model_contributions": {
+                    "bayesian_fusion": 0.40,
+                    "monte_carlo": 0.30,
+                    "markov_chain": 0.30
+                },
+                "backtest": None
+            }
+
         # ---- 设置确定性随机种子（同一天结果稳定）----
         import time
         from datetime import datetime
@@ -1090,6 +1284,11 @@ class EnhancedPredictor:
 
         cols, population, _, _ = self._get_cols_and_population()
         sample_size = len(cols)
+        # 快乐8：官方玩法为选一到选十，默认选十（10个号码）
+        # cols 有20列（开奖号码数），但投注只需选10个
+        # 支持通过 _override_kl8_sample_size 动态指定选号个数
+        if self.lottery_type == "kl8":
+            sample_size = getattr(self, '_override_kl8_sample_size', 10)
 
         # 方法1：加权融合抽样
         method1_sets = []
@@ -1132,51 +1331,86 @@ class EnhancedPredictor:
         sorted_by_conf = sorted(confidence.items(), key=lambda x: x[1], reverse=True)
 
         for group_idx in range(n_groups):
-            # 从高置信度号码中确定性选取
+            # 从高置信度号码中确定性选取（偏移重试 + 剩余补充，保证足量且不重复）
             candidates = [item[0] for item in sorted_by_conf[:sample_size * 3]]
-            # 用偏移代替 shuffle：每组从 candidates 中滑动窗口选取
-            offset = group_idx % max(1, len(candidates) - sample_size + 1)
-            nums = sorted(candidates[offset:offset + sample_size])
-            if len(nums) < sample_size:
-                # 兜底：从剩余高置信度补全
-                remaining = [item[0] for item in sorted_by_conf[sample_size * 3:]]
-                need = sample_size - len(nums)
-                nums = sorted(nums + remaining[:need])
-            nt = tuple(nums)
-            if nt not in used:
-                used.add(nt)
-                avg_conf = sum(confidence.get(n, 0) for n in nums) / len(nums)
-                if self.lottery_type == "ssq":
-                    valid, _ = validate_combination_ssq(nums)
-                    # 为双色球附加蓝球
-                    blue_population = list(range(1, 17))
-                    blue = self._weighted_pick_with_temperature(
-                        self.blue_fusion, blue_population, temp=0.3)
-                    recommendations.append({
-                        "nums": nums + [blue],
-                        "confidence": round(avg_conf, 4),
-                        "valid": valid
-                    })
-                elif self.lottery_type == "dlt":
-                    # 大乐透附加2个后区号码
-                    back_population = list(range(1, 13))
-                    back1 = self._weighted_pick_with_temperature(
-                        self.blue_fusion, back_population, temp=0.3)
-                    remaining_back = [b for b in back_population if b != back1]
-                    back2 = self._weighted_pick_with_temperature(
-                        {k: v for k, v in self.blue_fusion.items() if k != back1},
-                        remaining_back, temp=0.3)
-                    recommendations.append({
-                        "nums": nums + sorted([back1, back2]),
-                        "confidence": round(avg_conf, 4),
-                        "valid": True
-                    })
-                else:
-                    recommendations.append({
-                        "nums": nums,
-                        "confidence": round(avg_conf, 4),
-                        "valid": True
-                    })
+            max_off = max(1, len(candidates) - sample_size + 1)
+            chosen = None
+            for try_off in range(max_off):
+                offset = (group_idx + try_off) % max_off
+                nums = sorted(candidates[offset:offset + sample_size])
+                if len(nums) < sample_size:
+                    remaining = [item[0] for item in sorted_by_conf[sample_size * 3:]]
+                    need = sample_size - len(nums)
+                    nums = sorted(nums + remaining[:need])
+                nt = tuple(nums)
+                if nt not in used:
+                    used.add(nt)
+                    chosen = nums
+                    break
+            if chosen is None:
+                # 兜底：从更靠后的高置信度号码中取，避免位置制彩票(如七星彩)因号码池小导致重复不足
+                for extra in range(sample_size * 3, len(sorted_by_conf) - sample_size + 1):
+                    nums = sorted([item[0] for item in sorted_by_conf[extra:extra + sample_size]])
+                    nt = tuple(nums)
+                    if nt not in used:
+                        used.add(nt)
+                        chosen = nums
+                        break
+            if chosen is None:
+                break
+            avg_conf = sum(confidence.get(n, 0) for n in chosen) / len(chosen)
+            if self.lottery_type == "ssq":
+                valid, _ = validate_combination_ssq(chosen)
+                # 为双色球附加蓝球
+                blue_population = list(range(1, 17))
+                blue = self._weighted_pick_with_temperature(
+                    self.blue_fusion, blue_population, temp=0.3)
+                recommendations.append({
+                    "nums": chosen + [blue],
+                    "confidence": round(avg_conf, 4),
+                    "valid": valid
+                })
+            elif self.lottery_type == "dlt":
+                # 大乐透附加2个后区号码
+                back_population = list(range(1, 13))
+                back1 = self._weighted_pick_with_temperature(
+                    self.blue_fusion, back_population, temp=0.3)
+                remaining_back = [b for b in back_population if b != back1]
+                back2 = self._weighted_pick_with_temperature(
+                    {k: v for k, v in self.blue_fusion.items() if k != back1},
+                    remaining_back, temp=0.3)
+                recommendations.append({
+                    "nums": chosen + sorted([back1, back2]),
+                    "confidence": round(avg_conf, 4),
+                    "valid": True
+                })
+            else:
+                recommendations.append({
+                    "nums": chosen,
+                    "confidence": round(avg_conf, 4),
+                    "valid": True
+                })
+
+        # 模型贡献权重：优先用历史回溯验证的真实吻合度，否则回退写死比例
+        model_contributions = {
+            "bayesian_fusion": 0.40,
+            "monte_carlo": 0.30,
+            "markov_chain": 0.30
+        }
+        if self.lottery_type in ("ssq", "dlt", "kl8"):
+            backtest = monte_carlo_backtest(
+                self.lottery_type, top_k=sample_size, n_recent=30)
+            if "error" not in backtest:
+                contrib_raw = {
+                    "bayesian_fusion": backtest["fusion_hit_rate"],
+                    "monte_carlo": backtest["mc_hit_rate"],
+                    "markov_chain": backtest["markov_hit_rate"],
+                }
+                csum = sum(contrib_raw.values())
+                if csum > 0:
+                    model_contributions = {
+                        k: round(v / csum, 2) for k, v in contrib_raw.items()
+                    }
 
         return {
             "lottery_type": self.lottery_type,
@@ -1184,11 +1418,8 @@ class EnhancedPredictor:
                 str(k): v for k, v in sorted_by_conf[:15]
             },
             "recommendations": recommendations,
-            "model_contributions": {
-                "bayesian_fusion": 0.40,
-                "monte_carlo": 0.30,
-                "markov_chain": 0.30
-            }
+            "model_contributions": model_contributions,
+            "backtest": backtest if self.lottery_type in ("ssq", "dlt", "kl8") else None
         }
 
 
@@ -1245,10 +1476,37 @@ def enhanced_predict_pl3(n_groups: int = 5) -> List[Tuple[int, int, int]]:
     return pred.predict_pl3(n_groups)
 
 
-def get_ensemble_prediction(lottery_type: str, n_groups: int = 5) -> Dict:
-    """获取集成预测结果"""
+def get_ensemble_prediction(lottery_type: str, n_groups: int = 5,
+                            ai_review: bool = False,
+                            kl8_pick_size: int = 10) -> Dict:
+    """获取集成预测结果，可选 AI 候选池审阅。
+
+    Args:
+        lottery_type: 彩种代码
+        n_groups: 生成组数
+        ai_review: 是否启用 AI 候选池审阅（需 AI 已配置）
+        kl8_pick_size: 快乐8选号个数（1-10），默认10（选十玩法）
+    """
     pred = _get_predictor(lottery_type)
-    return pred.get_ensemble_prediction(n_groups)
+    # 快乐8：临时覆盖 sample_size（选号个数）
+    _orig_sample_size = None
+    if lottery_type == "kl8":
+        kl8_pick_size = max(1, min(10, int(kl8_pick_size)))
+        _orig_sample_size = getattr(pred, '_override_kl8_sample_size', None)
+        pred._override_kl8_sample_size = kl8_pick_size
+
+    result = pred.get_ensemble_prediction(n_groups)
+
+    # 恢复
+    if _orig_sample_size is not None:
+        pred._override_kl8_sample_size = _orig_sample_size
+    elif hasattr(pred, '_override_kl8_sample_size'):
+        delattr(pred, '_override_kl8_sample_size')
+
+    if ai_review and "error" not in result:
+        result = _apply_ai_review(lottery_type, result, pred, n_groups)
+
+    return result
 
 
 def get_feature_summary(lottery_type: str) -> Dict:
@@ -1264,3 +1522,258 @@ def get_confidence_distribution(lottery_type: str) -> Dict[int, float]:
     if "confidence_distribution" in ensemble:
         return {int(k): v for k, v in ensemble["confidence_distribution"].items()}
     return {}
+
+
+def _apply_ai_review(lottery_type: str, ensemble_result: Dict,
+                     predictor: "EnhancedPredictor",
+                     n_groups: int) -> Dict:
+    """AI 候选池审阅后调整置信度并重新生成推荐组。
+
+    流程：
+    1. 从 ensemble_result 提取候选池 + 置信度
+    2. 构建统计摘要，调用 ai_predict.ai_review_pool()
+    3. 根据优先/回避标记调整置信度（优先+20%，回避-50%）
+    4. 用调整后的置信度重新选号生成推荐组
+    """
+    try:
+        from ai_predict import ai_review_pool, is_ai_configured
+    except ImportError:
+        ensemble_result["ai_review"] = {"prioritized": [], "avoided": [], "reasoning": "ai_predict 模块不可用"}
+        return ensemble_result
+
+    if not is_ai_configured():
+        ensemble_result["ai_review"] = {"prioritized": [], "avoided": [], "reasoning": "AI 未配置，跳过审阅"}
+        return ensemble_result
+
+    # 提取候选池和置信度
+    conf_dist = ensemble_result.get("confidence_distribution", {})
+    if not conf_dist:
+        # 位置制彩票没有 confidence_distribution，从 recommendations 提取
+        recs = ensemble_result.get("recommendations", [])
+        all_nums = []
+        for rec in recs:
+            all_nums.extend(rec.get("nums", []))
+        candidate_pool = list(set(all_nums))
+        confidence = {n: 1.0 / len(candidate_pool) for n in candidate_pool} if candidate_pool else {}
+    else:
+        confidence = {int(k): float(v) for k, v in conf_dist.items()}
+        candidate_pool = list(confidence.keys())
+
+    if not candidate_pool:
+        ensemble_result["ai_review"] = {"prioritized": [], "avoided": [], "reasoning": "候选池为空"}
+        return ensemble_result
+
+    # 构建统计摘要
+    recent_stats = _build_recent_stats(predictor)
+    backtest_info = ensemble_result.get("backtest")
+    backtest_summary = ""
+    if backtest_info and isinstance(backtest_info, dict) and "error" not in backtest_info:
+        backtest_summary = (
+            f"融合命中率={backtest_info.get('fusion_hit_rate', 0):.1%}，"
+            f"蒙特卡洛命中率={backtest_info.get('mc_hit_rate', 0):.1%}，"
+            f"马尔可夫命中率={backtest_info.get('markov_hit_rate', 0):.1%}"
+        )
+
+    # 调用 AI 审阅
+    review = ai_review_pool(lottery_type, candidate_pool, confidence,
+                            recent_stats, backtest_summary)
+
+    prioritized = review.get("prioritized", [])
+    avoided = review.get("avoided", [])
+
+    if not prioritized and not avoided:
+        # AI 审阅无有效标记，保持原结果
+        ensemble_result["ai_review"] = review
+        return ensemble_result
+
+    # 调整置信度：优先+20%，回避-50%
+    adjusted_conf = dict(confidence)
+    for n in prioritized:
+        if n in adjusted_conf:
+            adjusted_conf[n] *= 1.2
+    for n in avoided:
+        if n in adjusted_conf:
+            adjusted_conf[n] *= 0.5
+
+    # 用调整后置信度重新生成推荐组
+    sorted_adj = sorted(adjusted_conf.items(), key=lambda x: x[1], reverse=True)
+
+    # 确定每组的号码数量
+    if lottery_type == "ssq":
+        sample_size = 6  # 红球
+    elif lottery_type == "dlt":
+        sample_size = 5  # 前区
+    elif lottery_type == "kl8":
+        sample_size = 10
+    elif lottery_type in ("qxc",):
+        sample_size = 7
+    else:  # pl3, fcsd
+        sample_size = 3
+
+    # 位置制彩票（qxc/pl3/fcsd）按位独立生成，AI 审阅只调整置信度
+    if lottery_type in ("qxc", "pl3", "fcsd"):
+        # 标记审阅结果，但保持原推荐组（位置制按位生成逻辑复杂，不宜重写）
+        ensemble_result["ai_review"] = review
+        ensemble_result["ai_adjusted_confidence"] = {str(k): round(v, 4) for k, v in sorted_adj[:15]}
+        return ensemble_result
+
+    # 非位置制：用调整后置信度重新选号
+    new_recommendations = []
+    used = set()
+
+    for group_idx in range(n_groups):
+        candidates = [item[0] for item in sorted_adj[:sample_size * 3]]
+        max_off = max(1, len(candidates) - sample_size + 1)
+        chosen = None
+        for try_off in range(max_off):
+            offset = (group_idx + try_off) % max_off
+            nums = sorted(candidates[offset:offset + sample_size])
+            if len(nums) < sample_size:
+                remaining = [item[0] for item in sorted_adj[sample_size * 3:]]
+                need = sample_size - len(nums)
+                nums = sorted(nums + remaining[:need])
+            nt = tuple(nums)
+            if nt not in used:
+                used.add(nt)
+                chosen = nums
+                break
+        if chosen is None:
+            for extra in range(sample_size * 3, len(sorted_adj) - sample_size + 1):
+                nums = sorted([item[0] for item in sorted_adj[extra:extra + sample_size]])
+                nt = tuple(nums)
+                if nt not in used:
+                    used.add(nt)
+                    chosen = nums
+                    break
+        if chosen is None:
+            break
+
+        avg_conf = sum(adjusted_conf.get(n, 0) for n in chosen) / len(chosen)
+
+        if lottery_type == "ssq":
+            blue_population = list(range(1, 17))
+            blue = predictor._weighted_pick_with_temperature(
+                predictor.blue_fusion, blue_population, temp=0.3)
+            new_recommendations.append({
+                "nums": chosen + [blue],
+                "confidence": round(avg_conf, 4),
+                "valid": True
+            })
+        elif lottery_type == "dlt":
+            back_population = list(range(1, 13))
+            back1 = predictor._weighted_pick_with_temperature(
+                predictor.blue_fusion, back_population, temp=0.3)
+            remaining_back = [b for b in back_population if b != back1]
+            back2 = predictor._weighted_pick_with_temperature(
+                {k: v for k, v in predictor.blue_fusion.items() if k != back1},
+                remaining_back, temp=0.3)
+            new_recommendations.append({
+                "nums": chosen + sorted([back1, back2]),
+                "confidence": round(avg_conf, 4),
+                "valid": True
+            })
+        else:
+            new_recommendations.append({
+                "nums": chosen,
+                "confidence": round(avg_conf, 4),
+                "valid": True
+            })
+
+    # 更新结果
+    if new_recommendations:
+        ensemble_result["recommendations"] = new_recommendations
+    ensemble_result["ai_review"] = review
+    ensemble_result["ai_adjusted_confidence"] = {str(k): round(v, 4) for k, v in sorted_adj[:15]}
+
+    return ensemble_result
+
+
+def _build_recent_stats(predictor: "EnhancedPredictor") -> str:
+    """从预测器提取近期统计摘要，供 AI 审阅参考。"""
+    try:
+        df = predictor.df
+        if df is None or df.empty:
+            return ""
+
+        lt = predictor.lottery_type
+        recent = df.head(30)
+        lines = [f"近{len(recent)}期数据概况："]
+
+        if lt == "ssq":
+            front_cols = [f"r{i}" for i in range(1, 7)]
+            all_nums = pd.concat([recent[c] for c in front_cols if c in recent.columns])
+            hot = all_nums.value_counts().head(5).to_dict()
+            cold = all_nums.value_counts().tail(5).to_dict()
+            lines.append(f"红球热号TOP5: {hot}")
+            lines.append(f"红球冷号TOP5: {cold}")
+        elif lt == "dlt":
+            front_cols = [f"f{i}" for i in range(1, 6)]
+            all_nums = pd.concat([recent[c] for c in front_cols if c in recent.columns])
+            hot = all_nums.value_counts().head(5).to_dict()
+            cold = all_nums.value_counts().tail(5).to_dict()
+            lines.append(f"前区热号TOP5: {hot}")
+            lines.append(f"前区冷号TOP5: {cold}")
+        elif lt == "kl8":
+            cols = [f"n{i:02d}" for i in range(1, 21)]
+            all_nums = pd.concat([recent[c] for c in cols if c in recent.columns])
+            hot = all_nums.value_counts().head(5).to_dict()
+            cold = all_nums.value_counts().tail(5).to_dict()
+            lines.append(f"热号TOP5: {hot}")
+            lines.append(f"冷号TOP5: {cold}")
+        else:
+            cols = [c for c in recent.columns if c.startswith("n") and c[1:].isdigit()]
+            if cols:
+                all_nums = pd.concat([recent[c] for c in cols])
+                hot = all_nums.value_counts().head(3).to_dict()
+                lines.append(f"各位热号TOP3: {hot}")
+
+        return "；".join(lines)
+    except Exception:
+        return ""
+
+
+def monte_carlo_backtest(lottery_type: str, top_k: int = None,
+                         n_recent: int = 30) -> Dict:
+    """
+    蒙特卡洛历史回溯验证：用当前融合/蒙特卡洛/马尔可夫的 Top-K 号码，
+    对最近 n_recent 期实际开奖做命中统计，输出各策略真实历史吻合度，
+    作为模型贡献权重的客观依据（替代写死的固定比例）。
+    仅支持双色球/大乐透/快乐8（位置制彩票按位建模，不适用统一 Top-K）。
+    """
+    if lottery_type not in ("ssq", "dlt", "kl8"):
+        return {"error": "仅支持双色球/大乐透/快乐8的回溯验证"}
+
+    pred = _get_predictor(lottery_type)
+    if not pred._initialized:
+        return {"error": "未初始化"}
+
+    cols, population, _, _ = pred._get_cols_and_population()
+    if top_k is None:
+        top_k = len(cols)
+
+    def _top_set(scores_dict):
+        s = sorted(scores_dict.items(), key=lambda x: x[1], reverse=True)
+        return set(item[0] for item in s[:top_k])
+
+    fusion_top = _top_set(pred.fusion_scores)
+    mc_top = _top_set(pred.monte_carlo_probs)
+    markov_top = _top_set(pred.markov_probs)
+
+    recent = pred.df.head(n_recent)
+
+    def _stat(top):
+        hits = []
+        for _, row in recent.iterrows():
+            actual = set(int(row[c]) for c in cols if c in row)
+            hits.append(len(actual & top))
+        return (sum(hits) / len(hits)) if hits else 0.0
+
+    return {
+        "lottery_type": lottery_type,
+        "top_k": top_k,
+        "n_recent": n_recent,
+        "fusion_hit_rate": round(_stat(fusion_top), 3),
+        "mc_hit_rate": round(_stat(mc_top), 3),
+        "markov_hit_rate": round(_stat(markov_top), 3),
+        "random_expectation": round(top_k * len(cols) / len(population), 3)
+    }

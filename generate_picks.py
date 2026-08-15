@@ -500,6 +500,42 @@ def format_3d_group6(groups):
     return "\n".join(lines)
 
 
+# ========== 体彩对冲（组合配比策略）专用生成器 ==========
+# 与福彩版 gen_kl8_pick1 / gen_3d_group6 对称：纯随机、无历史偏置，
+# 用于对冲页"快速给出一组可投注号码"，历史偏置版见 ai_predict._generate_*。
+
+def gen_pl3_group6(n_groups=5):
+    # 排列三 组选六：三个互不相同的数字 (0-9)，顺序无关
+    groups = []
+    for _ in range(n_groups):
+        groups.append(tuple(sorted(random.sample(range(10), 3))))
+    return groups
+
+
+def gen_qxc_pick7(n_groups=5):
+    # 七星彩 七位直选：每位 0-9 独立随机
+    groups = []
+    for _ in range(n_groups):
+        groups.append(tuple(random.randint(0, 9) for _ in range(7)))
+    return groups
+
+
+def format_pl3_group6(groups):
+    lines = []
+    for i, nums in enumerate(groups, 1):
+        num_str = " ".join(str(x) for x in nums)
+        lines.append(f"第{i:02d}注 {num_str} (组选六)")
+    return "\n".join(lines)
+
+
+def format_qxc_pick7(groups):
+    lines = []
+    for i, nums in enumerate(groups, 1):
+        num_str = " ".join(str(x) for x in nums)
+        lines.append(f"第{i:02d}注 {num_str}")
+    return "\n".join(lines)
+
+
 def format_ssq_plain(groups):
     """纯号码格式，不含标题，用于 AI 对比展示"""
     lines = []

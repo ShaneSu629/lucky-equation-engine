@@ -9,6 +9,7 @@ AI 预测与分析模块
 """
 
 import os
+import re
 import json
 import pandas as pd
 import numpy as np
@@ -23,6 +24,17 @@ except ImportError:
 CONFIG_DIR = Path.home() / ".lottery_ai"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 DATA_DIR = Path(__file__).parent / "data"
+
+# 数据库管理模块（替代 CSV 直读写）
+from db_manager import (
+    init_db, read_lottery_data as _db_read_lottery,
+    save_prediction_record as _db_save_prediction,
+    get_prediction_records as _db_get_prediction_records,
+    get_prediction_for_code as _db_get_prediction_for_code,
+    update_prediction_compare as _db_update_prediction_compare,
+    get_latest_code as _db_get_latest_code,
+    get_lottery_df as _db_get_lottery_df,
+)
 
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -48,11 +60,14 @@ def load_config() -> dict:
         import streamlit as st
         if hasattr(st, 'secrets') and 'ai_config' in st.secrets:
             sec = st.secrets['ai_config']
-            return {
+            cfg = {
                 "api_key": str(sec.get("api_key", "")),
                 "base_url": str(sec.get("base_url", DEFAULT_CONFIG["base_url"])),
                 "model": str(sec.get("model", DEFAULT_CONFIG["model"]))
             }
+            # 若 Secrets 中未配置 api_key，则回退到本地配置文件
+            if cfg["api_key"].strip():
+                return cfg
     except Exception:
         pass
 
@@ -113,15 +128,8 @@ def _read_csv_file(file_path, **kwargs):
 
 
 def _read_lottery_data(name: str) -> pd.DataFrame:
-    csv_path = os.path.join("data", f"{name}.csv")
-    if not os.path.exists(csv_path):
-        return pd.DataFrame()
-    
-    try:
-        df = _read_csv_file(csv_path)
-        return df
-    except Exception:
-        return pd.DataFrame()
+    """从数据库读取彩种历史数据（兼容原 CSV 接口）。"""
+    return _db_read_lottery(name)
 
 
 def _get_ai_client():
@@ -163,6 +171,79 @@ def _call_ai(messages: list, max_tokens: int = 4000, temperature: float = 0.7) -
         return {"result": content}
     except Exception as e:
         return {"error": f"AI 调用失败: {str(e)}"}
+
+
+def _safe_json_parse(text):
+    """容错地从模型文本中提取 JSON 对象或数组。
+
+    依次尝试：直接解析 -> 剥离 ```json 代码围栏 -> 括号配平截取最外层 { } 或 [ ]。
+    返回 dict/list，解析失败返回 None。
+    """
+    if not text or not isinstance(text, str):
+        return None
+    s = text.strip()
+    # 1) 直接解析整段
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    # 2) 剥离 ```json ... ``` 或 ``` ... ``` 代码围栏
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", s, re.IGNORECASE)
+    if fence:
+        inner = fence.group(1).strip()
+        try:
+            return json.loads(inner)
+        except Exception:
+            s = inner
+    # 3) 括号配平：从最外层 { } 或 [ ] 截取后再解析（避免被正文里的花括号干扰）
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start = s.find(opener)
+        if start == -1:
+            continue
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(s)):
+            c = s[i]
+            if esc:
+                esc = False
+                continue
+            if c == "\\":
+                esc = True
+                continue
+            if c == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if c == opener:
+                depth += 1
+            elif c == closer:
+                depth -= 1
+                if depth == 0:
+                    candidate = s[start:i + 1]
+                    try:
+                        return json.loads(candidate)
+                    except Exception:
+                        break
+    return None
+
+
+def _call_ai_json(messages, max_tokens=5000, temperature=0.5, retries=2):
+    """调用 AI 并解析 JSON；解析失败时自动降温度重试（输出在 temperature>0 时具有随机性）。
+
+    返回 (parsed, error)：成功时 error 为 None，失败时 parsed 为 None 且 error 为可读信息。
+    """
+    last_err = "AI 返回格式异常，请重试"
+    for attempt in range(retries + 1):
+        t = temperature if attempt == 0 else max(0.1, temperature - 0.2)
+        result = _call_ai(messages, max_tokens=max_tokens, temperature=t)
+        if "error" in result:
+            return None, result["error"]
+        parsed = _safe_json_parse(result.get("result", ""))
+        if parsed is not None:
+            return parsed, None
+    return None, last_err
 
 
 def _calculate_missing_periods(series, population):
@@ -326,7 +407,7 @@ def _calculate_prime_composite_ratio(df, cols):
 
 
 def _calculate_tail_distribution(df, cols):
-    """计算尾数分布"""
+    """计算尾数分布，并返回最近10期尾数种类数"""
     tail_counts = {}
     for _, row in df.iterrows():
         for col in cols:
@@ -335,8 +416,15 @@ def _calculate_tail_distribution(df, cols):
                 tail_counts[tail] = tail_counts.get(tail, 0) + 1
     total = sum(tail_counts.values())
     if total == 0:
-        return {}
-    return {str(k): round(v / total * 100, 1) for k, v in sorted(tail_counts.items())}
+        return {"recent": 0, "distribution": {}}
+    distribution = {str(k): round(v / total * 100, 1) for k, v in sorted(tail_counts.items())}
+    # 最近10期出现的尾数种类数
+    recent_tails = set()
+    for _, row in df.head(10).iterrows():
+        for col in cols:
+            if col in df.columns:
+                recent_tails.add(int(row[col]) % 10)
+    return {"recent": len(recent_tails), "distribution": distribution}
 
 
 def _calculate_big_small_ratio(df, cols, midpoint=17):
@@ -571,34 +659,30 @@ def ai_predict_ssq(n_groups: int = 5) -> dict:
 }}"""
 
     messages = [
-        {"role": "system", "content": "你是专业的彩票数据分析师，擅长基于历史数据预测号码。请严格按照要求的JSON格式输出，确保号码满足所有约束条件。"},
+        {"role": "system", "content": "你是专业的彩票数据分析师，擅长基于历史数据预测号码。请严格按照要求的JSON格式输出，确保号码满足所有约束条件，只返回一个用```json代码块包裹的JSON对象，不要输出任何解释性文字。"},
         {"role": "user", "content": prompt}
     ]
     
-    result = _call_ai(messages, max_tokens=5000, temperature=temperature)
-    
-    if "error" in result:
-        return result
-    
-    try:
-        import re
-        json_str = result["result"]
-        match = re.search(r'\{[\s\S]*\}', json_str)
-        if match:
-            parsed = json.loads(match.group())
-            return parsed
-        return {"error": "AI 返回格式异常，请重试"}
-    except Exception:
-        return {
-            "recommendations": [],
-            "analysis": result.get("result", ""),
-            "note": "AI 分析文字已返回，但号码解析失败，请参考分析文字手动选号"
-        }
+    parsed, err = _call_ai_json(messages, max_tokens=5000, temperature=temperature)
+    if err:
+        return {"error": err}
+    return parsed
 
 
-def ai_predict_kl8(n_groups: int = 5) -> dict:
+def ai_predict_kl8(n_groups: int = 5, pick_size: int = 10) -> dict:
+    """快乐8 AI预测。
+
+    Args:
+        n_groups: 生成组数
+        pick_size: 选号个数（选一=1 ~ 选十=10），默认10（选十玩法）
+    """
+    pick_size = max(1, min(10, int(pick_size)))  # 限制 1-10
+    _play_names = {1:"选一",2:"选二",3:"选三",4:"选四",5:"选五",
+                   6:"选六",7:"选七",8:"选八",9:"选九",10:"选十"}
+    play_name = _play_names.get(pick_size, f"选{pick_size}")
+
     df = _read_lottery_data("kl8")
-    
+
     if df.empty:
         return {"error": "暂无快乐8历史数据，请先同步数据"}
     
@@ -654,7 +738,21 @@ def ai_predict_kl8(n_groups: int = 5) -> dict:
     
     temperature = 0.5 + volatility * 0.4
     
-    prompt = f"""你是一个专业的彩票数据分析专家。请基于以下快乐8历史多维数据，生成 {n_groups} 组"选十"推荐号码。
+    # 动态约束：根据 pick_size 调整区间和大小约束
+    if pick_size >= 8:
+        _zone_hint = "四个区间各有 2-3 个号码，不能有区间完全断档"
+        _hot_cold = "热号与冷号的平衡（建议 6:4 或 7:3）"
+        _repeat_limit = 5
+    elif pick_size >= 5:
+        _zone_hint = "尽量覆盖至少3个区间，避免过度集中"
+        _hot_cold = "热号与冷号的平衡（建议 6:4 或 5:5）"
+        _repeat_limit = 4
+    else:
+        _zone_hint = "尽量分散在不同区间"
+        _hot_cold = "优先选择热号，兼顾冷号回补"
+        _repeat_limit = 3
+
+    prompt = f"""你是一个专业的彩票数据分析专家。请基于以下快乐8历史多维数据，生成 {n_groups} 组"{play_name}"推荐号码（每组选 {pick_size} 个号码）。
 
 【最近10期开奖数据（前5期示例）】
 {recent_10.head(5)[['code', 'date', 'n01', 'n02', 'n03', 'n04', 'n05']].to_string(index=False)}
@@ -697,13 +795,13 @@ def ai_predict_kl8(n_groups: int = 5) -> dict:
 【数据波动指数】{round(volatility, 2)}
 {enhanced_str}
 【分析要求】
-1. 每组10个号码（1-80），不重复
-2. **区间约束**：四个区间各有 2-4 个号码，不能有区间完全断档
-3. **大小平衡**：大小比约 5:5 或 4:6（参考趋势）
+1. 每组{pick_size}个号码（1-80），不重复
+2. **区间约束**：{_zone_hint}
+3. **大小平衡**：参考趋势分布
 4. **012路约束**：避免极端偏态
-5. 热号与冷号的平衡（建议 6:4 或 7:3）
-6. 和值范围在 {int(sum_dist['avg'])-25} 到 {int(sum_dist['avg'])+25} 之间
-7. 避免与最近5期重复超过5个号码
+5. {_hot_cold}
+6. 和值范围在 {int(sum_dist['avg'] * pick_size / 20)-20} 到 {int(sum_dist['avg'] * pick_size / 20)+20} 之间
+7. 避免与最近5期重复超过{_repeat_limit}个号码
 8. 每组给出基于数据的简短分析
 
 【输出格式】严格按以下JSON格式：
@@ -711,7 +809,7 @@ def ai_predict_kl8(n_groups: int = 5) -> dict:
   "recommendations": [
     {{
       "group": 1,
-      "numbers": [号码1, ..., 号码10],
+      "numbers": [号码1, ..., 号码{pick_size}],
       "reason": "简短分析"
     }}
   ],
@@ -719,29 +817,18 @@ def ai_predict_kl8(n_groups: int = 5) -> dict:
 }}"""
 
     messages = [
-        {"role": "system", "content": "你是专业的彩票数据分析师，擅长基于历史数据预测号码。请严格按照要求的JSON格式输出。"},
+        {"role": "system", "content": "你是专业的彩票数据分析师，擅长基于历史数据预测号码。请严格按照要求的JSON格式输出，只返回一个用```json代码块包裹的JSON对象，不要输出任何解释性文字。"},
         {"role": "user", "content": prompt}
     ]
     
-    result = _call_ai(messages, max_tokens=5000, temperature=temperature)
-    
-    if "error" in result:
-        return result
-    
-    try:
-        import re
-        json_str = result["result"]
-        match = re.search(r'\{[\s\S]*\}', json_str)
-        if match:
-            parsed = json.loads(match.group())
-            return parsed
-        return {"error": "AI 返回格式异常，请重试"}
-    except Exception:
-        return {
-            "recommendations": [],
-            "analysis": result.get("result", ""),
-            "note": "AI 分析文字已返回，但号码解析失败"
-        }
+    parsed, err = _call_ai_json(messages, max_tokens=5000, temperature=temperature)
+    if err:
+        return {"error": err}
+    # 附带玩法信息
+    if isinstance(parsed, dict):
+        parsed["play_name"] = play_name
+        parsed["pick_size"] = pick_size
+    return parsed
 
 
 def ai_predict_fcsd(n_groups: int = 5) -> dict:
@@ -852,29 +939,14 @@ def ai_predict_fcsd(n_groups: int = 5) -> dict:
 }}"""
 
     messages = [
-        {"role": "system", "content": "你是专业的彩票数据分析师，擅长基于历史数据预测号码。请严格按照要求的JSON格式输出。"},
+        {"role": "system", "content": "你是专业的彩票数据分析师，擅长基于历史数据预测号码。请严格按照要求的JSON格式输出，只返回一个用```json代码块包裹的JSON对象，不要输出任何解释性文字。"},
         {"role": "user", "content": prompt}
     ]
     
-    result = _call_ai(messages, max_tokens=4000, temperature=temperature)
-    
-    if "error" in result:
-        return result
-    
-    try:
-        import re
-        json_str = result["result"]
-        match = re.search(r'\{[\s\S]*\}', json_str)
-        if match:
-            parsed = json.loads(match.group())
-            return parsed
-        return {"error": "AI 返回格式异常，请重试"}
-    except Exception:
-        return {
-            "recommendations": [],
-            "analysis": result.get("result", ""),
-            "note": "AI 分析文字已返回，但号码解析失败"
-        }
+    parsed, err = _call_ai_json(messages, max_tokens=4000, temperature=temperature)
+    if err:
+        return {"error": err}
+    return parsed
 
 
 def ai_predict_dlt(n_groups: int = 5) -> dict:
@@ -968,7 +1040,7 @@ def ai_predict_dlt(n_groups: int = 5) -> dict:
 【大小比】大号(18-35): {bs_data['big_pct']}% | 小号(1-17): {bs_data['small_pct']}%
 【奇偶比例趋势】最近10期: {', '.join(parity_trend)}
 【区间分布】一区(01-12): {zone_dist['一区(01-12)']}% | 二区(13-24): {zone_dist['二区(13-24)']}% | 三区(25-35): {zone_dist['三区(25-35)']}%
-【龙头凤尾】龙头: {dragon_phoenix['dragon_trend']} | 凤尾: {dragon_phoenix['phoenix_trend']}
+【龙头凤尾】龙头: {dragon_phoenix.get('dragon_recent', [])} | 凤尾: {dragon_phoenix.get('phoenix_recent', [])}
 【衰减加权频率TOP10】{dict(sorted(decay_freq.items(), key=lambda x: x[1], reverse=True)[:10])}
 【数据波动指数】{round(volatility, 2)}
 {enhanced_str}
@@ -996,29 +1068,14 @@ def ai_predict_dlt(n_groups: int = 5) -> dict:
 }}"""
 
     messages = [
-        {"role": "system", "content": "你是专业的彩票数据分析师，擅长基于历史数据预测号码。请严格按照要求的JSON格式输出。"},
+        {"role": "system", "content": "你是专业的彩票数据分析师，擅长基于历史数据预测号码。请严格按照要求的JSON格式输出，只返回一个用```json代码块包裹的JSON对象，不要输出任何解释性文字。"},
         {"role": "user", "content": prompt}
     ]
     
-    result = _call_ai(messages, max_tokens=5000, temperature=temperature)
-    
-    if "error" in result:
-        return result
-    
-    try:
-        import re
-        json_str = result["result"]
-        match = re.search(r'\{[\s\S]*\}', json_str)
-        if match:
-            parsed = json.loads(match.group())
-            return parsed
-        return {"error": "AI 返回格式异常，请重试"}
-    except Exception:
-        return {
-            "recommendations": [],
-            "analysis": result.get("result", ""),
-            "note": "AI 分析文字已返回，但号码解析失败"
-        }
+    parsed, err = _call_ai_json(messages, max_tokens=5000, temperature=temperature)
+    if err:
+        return {"error": err}
+    return parsed
 
 
 def ai_predict_qxc(n_groups: int = 5) -> dict:
@@ -1104,29 +1161,14 @@ def ai_predict_qxc(n_groups: int = 5) -> dict:
 }}"""
 
     messages = [
-        {"role": "system", "content": "你是专业的彩票数据分析师，擅长基于历史数据预测号码。请严格按照要求的JSON格式输出。"},
+        {"role": "system", "content": "你是专业的彩票数据分析师，擅长基于历史数据预测号码。请严格按照要求的JSON格式输出，只返回一个用```json代码块包裹的JSON对象，不要输出任何解释性文字。"},
         {"role": "user", "content": prompt}
     ]
     
-    result = _call_ai(messages, max_tokens=4000, temperature=temperature)
-    
-    if "error" in result:
-        return result
-    
-    try:
-        import re
-        json_str = result["result"]
-        match = re.search(r'\{[\s\S]*\}', json_str)
-        if match:
-            parsed = json.loads(match.group())
-            return parsed
-        return {"error": "AI 返回格式异常，请重试"}
-    except Exception:
-        return {
-            "recommendations": [],
-            "analysis": result.get("result", ""),
-            "note": "AI 分析文字已返回，但号码解析失败"
-        }
+    parsed, err = _call_ai_json(messages, max_tokens=4000, temperature=temperature)
+    if err:
+        return {"error": err}
+    return parsed
 
 
 def ai_predict_pl3(n_groups: int = 5) -> dict:
@@ -1231,29 +1273,14 @@ def ai_predict_pl3(n_groups: int = 5) -> dict:
 }}"""
 
     messages = [
-        {"role": "system", "content": "你是专业的彩票数据分析师，擅长基于历史数据预测号码。请严格按照要求的JSON格式输出。"},
+        {"role": "system", "content": "你是专业的彩票数据分析师，擅长基于历史数据预测号码。请严格按照要求的JSON格式输出，只返回一个用```json代码块包裹的JSON对象，不要输出任何解释性文字。"},
         {"role": "user", "content": prompt}
     ]
     
-    result = _call_ai(messages, max_tokens=4000, temperature=temperature)
-    
-    if "error" in result:
-        return result
-    
-    try:
-        import re
-        json_str = result["result"]
-        match = re.search(r'\{[\s\S]*\}', json_str)
-        if match:
-            parsed = json.loads(match.group())
-            return parsed
-        return {"error": "AI 返回格式异常，请重试"}
-    except Exception:
-        return {
-            "recommendations": [],
-            "analysis": result.get("result", ""),
-            "note": "AI 分析文字已返回，但号码解析失败"
-        }
+    parsed, err = _call_ai_json(messages, max_tokens=4000, temperature=temperature)
+    if err:
+        return {"error": err}
+    return parsed
 
 
 def ai_analyze_trend(name: str) -> str:
@@ -1497,11 +1524,8 @@ def ai_optimize_hedge(ssq_bets: int, hedge_strategy: str) -> dict:
     recommended_hedge = None
     
     try:
-        import re
-        json_str = result.get("result", "")
-        match = re.search(r'\{[\s\S]*\}', json_str)
-        if match:
-            parsed = json.loads(match.group())
+        parsed = _safe_json_parse(result.get("result", ""))
+        if isinstance(parsed, dict):
             advice = parsed.get("advice", "")
             recommended_hedge = parsed.get("recommended_hedge", None)
     except Exception:
@@ -1570,6 +1594,288 @@ def ai_optimize_hedge(ssq_bets: int, hedge_strategy: str) -> dict:
     return {
         "advice": advice,
         "ssq_groups": ssq_groups,
+        "hedge_groups": hedge_groups,
+        "hedge_type": hedge_type,
+        "hedge_name": hedge_name,
+        "hedge_bets": hedge_bets
+    }
+
+
+# ========== 体彩版对冲（组合配比策略） ==========
+# 与 ai_optimize_hedge 对称：核心=大乐透，对冲=排列三/七星彩。
+
+def _generate_dlt_groups(n: int, df: pd.DataFrame) -> list:
+    """大乐透：基于近30期热号生成前区5+后区2组合（dict 结构便于 UI 渲染）。"""
+    if df.empty:
+        return []
+    recent_30 = df.head(30)
+    try:
+        all_fronts = pd.concat([recent_30['f1'], recent_30['f2'], recent_30['f3'],
+                                recent_30['f4'], recent_30['f5']])
+        front_counts = all_fronts.value_counts()
+        back_counts = pd.concat([recent_30['b1'], recent_30['b2']]).value_counts()
+        hot_fronts = []
+        for x in front_counts.head(20).index.tolist():
+            try:
+                hot_fronts.append(int(x))
+            except (ValueError, TypeError):
+                continue
+        hot_backs = []
+        for x in back_counts.head(8).index.tolist():
+            try:
+                hot_backs.append(int(x))
+            except (ValueError, TypeError):
+                continue
+        import random
+        groups = []
+        used = set()
+        while len(groups) < n and len(hot_fronts) >= 5 and len(hot_backs) >= 2:
+            try:
+                fronts = sorted(random.sample(hot_fronts, 5))
+                backs = sorted(random.sample(hot_backs, 2))
+                key = tuple(fronts + backs)
+                if key not in used:
+                    used.add(key)
+                    groups.append({"front": fronts, "back": backs})
+            except Exception:
+                break
+        return groups
+    except Exception:
+        return []
+
+
+def _generate_pl3_group6(n: int, df: pd.DataFrame) -> list:
+    """排列三组选六：三个互不相同的数字(0-9)，顺序无关（基于历史热号并集）。"""
+    if df.empty:
+        return []
+    recent_30 = df.head(30)
+    try:
+        import random
+        all_nums = pd.concat([recent_30['n1'], recent_30['n2'], recent_30['n3']])
+        hot = []
+        for x in all_nums.value_counts().head(8).index.tolist():
+            try:
+                hot.append(int(x))
+            except (ValueError, TypeError):
+                continue
+        if len(hot) < 3:
+            hot = list(range(10))
+        used = set()
+        groups = []
+        while len(groups) < n:
+            combo = tuple(sorted(random.sample(hot, 3)))
+            if combo not in used:
+                used.add(combo)
+                groups.append(list(combo))
+            if len(used) >= min(len(hot), 10) or len(used) >= 120:
+                break
+        return groups
+    except Exception:
+        return []
+
+
+def _generate_qxc_pick7(n: int, df: pd.DataFrame) -> list:
+    """七星彩七位：每位0-9独立随机（历史不足时回退纯随机）。"""
+    if df.empty:
+        return []
+    try:
+        import random
+        return [tuple(random.randint(0, 9) for _ in range(7)) for _ in range(n)]
+    except Exception:
+        return []
+
+
+def ai_optimize_hedge_sports(dlt_bets: int, hedge_strategy: str) -> dict:
+    """体彩版对冲优化：核心主投大乐透，对冲排列三/七星彩。
+
+    Args:
+        dlt_bets: 大乐透主投注数。
+        hedge_strategy: 当前选择的方案文案（含"方案 A"/"方案 B"）。
+    Returns:
+        含 advice / dlt_groups / hedge_groups / hedge_type / hedge_name / hedge_bets 的字典；
+        AI 调用失败时含 "error"。
+    """
+    dlt_cost = dlt_bets * 2
+
+    strategy_info = {
+        "方案 A": {"name": "排列三组选六", "win_rate": 1/167, "prize": 173, "cost": 2},
+        "方案 B": {"name": "七星彩七位直选", "win_rate": 1e-7, "prize": 0, "cost": 2}
+    }
+
+    current_strategy_name = None
+    current_strategy_detail = None
+    for key, detail in strategy_info.items():
+        if key in hedge_strategy:
+            current_strategy_name = key
+            current_strategy_detail = detail
+            break
+
+    dlt_df = _read_lottery_data("dlt")
+    pl3_df = _read_lottery_data("pl3")
+    qxc_df = _read_lottery_data("qxc")
+
+    dlt_stats = ""
+    if not dlt_df.empty:
+        recent_10 = dlt_df.head(10)
+        recent_30 = dlt_df.head(30)
+        recent_50 = dlt_df.head(50)
+        front_cols = ['f1', 'f2', 'f3', 'f4', 'f5']
+        all_fronts_30 = pd.concat([recent_30[c] for c in front_cols])
+        front_counts_30 = all_fronts_30.value_counts()
+        front_counts_50 = pd.concat([recent_50[c] for c in front_cols]).value_counts()
+        missing_periods = _calculate_missing_periods(all_fronts_30, list(range(1, 36)))
+        sorted_missing = sorted(missing_periods.items(), key=lambda x: x[1], reverse=True)
+        coldest_fronts = {k: v for k, v in sorted_missing[:5]}
+        hottest_fronts = {k: v for k, v in sorted_missing[-5:]}
+        consecutive_prob = _calculate_consecutive_prob(recent_30, front_cols)
+        sum_dist = _calculate_sum_distribution(recent_30, front_cols)
+        parity_trend = _calculate_parity_trend(recent_30, front_cols)
+        zone_dist = _calculate_zone_distribution(recent_30, front_cols, {
+            "一区(01-12)": (1, 12),
+            "二区(13-24)": (13, 24),
+            "三区(25-35)": (25, 35)
+        })
+        dlt_stats = f"""
+- 大乐透历史数据：{len(dlt_df)} 期
+- 最近10期后区均值：{recent_10['b1'].mean():.1f} / {recent_10['b2'].mean():.1f}
+- 最近30期前区热号TOP5：{front_counts_30.head(5).to_dict()}
+- 最近50期前区热号TOP5：{front_counts_50.head(5).to_dict()}
+- 最冷前区TOP5（遗漏期数）：{coldest_fronts}
+- 最热前区TOP5（遗漏期数）：{hottest_fronts}
+- 连号概率：{consecutive_prob}%
+- 和值统计：最小={sum_dist['min']}, 最大={sum_dist['max']}, 平均={sum_dist['avg']}, 众数={sum_dist['mode']}
+- 奇偶比例趋势（最近10期）：{', '.join(parity_trend)}
+- 区间分布：一区{zone_dist['一区(01-12)']}%, 二区{zone_dist['二区(13-24)']}%, 三区{zone_dist['三区(25-35)']}%"""
+
+    pl3_stats = ""
+    if not pl3_df.empty:
+        recent_30 = pl3_df.head(30)
+        n1_hot = recent_30['n1'].value_counts().head(5).to_dict()
+        n2_hot = recent_30['n2'].value_counts().head(5).to_dict()
+        n3_hot = recent_30['n3'].value_counts().head(5).to_dict()
+        pl3_stats = f"""
+- 排列三历史数据：{len(pl3_df)} 期
+- 百位热号TOP5：{n1_hot}
+- 十位热号TOP5：{n2_hot}
+- 个位热号TOP5：{n3_hot}"""
+
+    qxc_stats = ""
+    if not qxc_df.empty:
+        recent_30 = qxc_df.head(30)
+        qxc_cols = [f"n{i}" for i in range(1, 8)]
+        qxc_hot = {}
+        for c in qxc_cols:
+            if c in recent_30.columns:
+                qxc_hot[c] = recent_30[c].value_counts().head(3).to_dict()
+        qxc_stats = f"""
+- 七星彩历史数据：{len(qxc_df)} 期
+- 各位热号TOP3：{qxc_hot}"""
+
+    current_strategy_desc = ""
+    if current_strategy_detail:
+        prize_desc = f"{current_strategy_detail['prize']}" if current_strategy_detail['prize'] else "浮动(高奖级)"
+        current_strategy_desc = f"""
+当前选择的对冲方案：{current_strategy_name}（{current_strategy_detail['name']}）
+- 中奖率：{current_strategy_detail['win_rate']*100:.4f}%
+- 奖金：{prize_desc}元
+- 每注成本：{current_strategy_detail['cost']}元
+"""
+
+    prompt = f"""你是一个专业的体育彩票投资策略顾问，擅长运用概率论和统计学分析对冲策略。
+
+【用户投注计划】
+- 大乐透主投：{dlt_bets} 注（{dlt_cost} 元）
+{current_strategy_desc}
+
+【历史数据概况】{dlt_stats}{pl3_stats}{qxc_stats}
+
+【请完成以下分析】
+
+1. 📊 当前方案分析（如果用户选择了固定方案）：
+   - 分析该方案的优缺点
+   - 指出该方案在当前数据趋势下的不合理之处
+   - 计算数学期望：E = 中奖率 × 奖金 - 成本
+
+2. 🤖 AI 智能推荐：
+   - 不局限于现有的固定方案，可以提出创新的对冲策略
+   - 推荐理由必须基于历史数据趋势分析
+   - 例如：排列三直选、排列三组选三、七星彩组选，或者组合策略
+
+3. 💰 预算分配建议：
+   - 大乐透和对冲的资金比例
+   - 具体的投注注数
+
+【输出格式】严格按照以下JSON格式输出：
+{{
+  "advice": "分析建议文本（Markdown格式，500字以内）",
+  "recommended_hedge": {{
+    "type": "对冲类型代码",
+    "name": "对冲类型中文名称",
+    "bets": 推荐注数
+  }}
+}}
+
+【对冲类型代码说明】
+- pl3_group6: 排列三组选六
+- qxc_pick7: 七星彩七位直选
+
+请根据数据分析给出最佳推荐。请确保只输出JSON，不要解释文字。"""
+
+    messages = [
+        {"role": "system", "content": "你是专业的体育彩票投资策略顾问，帮助用户科学分配投注资金，控制风险。"},
+        {"role": "user", "content": prompt}
+    ]
+
+    result = _call_ai(messages, max_tokens=2000)
+    if "error" in result:
+        return result
+
+    advice = ""
+    recommended_hedge = None
+    try:
+        parsed = _safe_json_parse(result.get("result", ""))
+        if isinstance(parsed, dict):
+            advice = parsed.get("advice", "")
+            recommended_hedge = parsed.get("recommended_hedge", None)
+    except Exception:
+        advice = result.get("result", "")
+
+    dlt_groups = []
+    hedge_groups = []
+    hedge_type = ""
+    hedge_name = ""
+    hedge_bets = 5
+
+    if not dlt_df.empty:
+        dlt_groups = _generate_dlt_groups(dlt_bets, dlt_df)
+
+    if recommended_hedge:
+        hedge_type_code = recommended_hedge.get("type", "")
+        hedge_name = recommended_hedge.get("name", "")
+        hedge_bets = recommended_hedge.get("bets", 5)
+        if hedge_type_code.startswith("pl3"):
+            hedge_type = "pl3"
+            if not pl3_df.empty:
+                hedge_groups = _generate_pl3_group6(hedge_bets, pl3_df)
+        elif hedge_type_code.startswith("qxc"):
+            hedge_type = "qxc"
+            if not qxc_df.empty:
+                hedge_groups = _generate_qxc_pick7(hedge_bets, qxc_df)
+    else:
+        if "排列三" in advice or (current_strategy_detail and "排列三" in current_strategy_detail["name"]):
+            hedge_type = "pl3"
+            hedge_name = "排列三组选六"
+            if not pl3_df.empty:
+                hedge_groups = _generate_pl3_group6(5, pl3_df)
+        elif "七星彩" in advice or (current_strategy_detail and "七星彩" in current_strategy_detail["name"]):
+            hedge_type = "qxc"
+            hedge_name = "七星彩七位直选"
+            if not qxc_df.empty:
+                hedge_groups = _generate_qxc_pick7(5, qxc_df)
+
+    return {
+        "advice": advice,
+        "dlt_groups": dlt_groups,
         "hedge_groups": hedge_groups,
         "hedge_type": hedge_type,
         "hedge_name": hedge_name,
@@ -2006,115 +2312,33 @@ def ai_compare_last_draw(name: str) -> dict:
             "ai_analysis": ai_result.get("analysis", "")
         }
 
-PREDICTION_RECORDS_FILE = DATA_DIR / 'predictions.csv'
+
+def _get_latest_code_from_csv(lottery_type: str) -> Optional[str]:
+    """从数据库读取最新开奖期号。"""
+    return _db_get_latest_code(lottery_type)
 
 
 def save_prediction_record(lottery_type: str, code: str, predictions: list, play_type: str = None):
-    DATA_DIR.mkdir(exist_ok=True)
-    
-    import time
-    new_record = {
-        'lottery_type': lottery_type,
-        'code': code,
-        'predictions': json.dumps(predictions, ensure_ascii=False),
-        'play_type': play_type or '',
-        'predict_time': time.strftime('%Y-%m-%d %H:%M:%S'),
-        'compared': 'false',
-        'compare_result': ''
-    }
-    
-    if PREDICTION_RECORDS_FILE.exists():
-        try:
-            df = _read_csv_file(PREDICTION_RECORDS_FILE, dtype={"code": str, "compared": str, "compare_result": str})
-            
-            mask = (df['lottery_type'] == lottery_type) & (df['code'] == code)
-            pt_col = df.get('play_type', '')
-            if play_type:
-                mask = mask & (pt_col == play_type)
-            
-            if mask.any():
-                for col in ['lottery_type', 'code', 'predictions', 'play_type', 'predict_time']:
-                    if col in df.columns:
-                        df.loc[mask, col] = new_record[col]
-            else:
-                df = pd.concat([pd.DataFrame([new_record]), df], ignore_index=True)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            df = pd.DataFrame([new_record])
-    else:
-        df = pd.DataFrame([new_record])
-    
-    if len(df) > 100:
-        df = df.head(100)
-    
-    df.to_csv(PREDICTION_RECORDS_FILE, index=False, encoding='utf-8-sig')
+    """保存预测记录（委托数据库模块）。"""
+    _db_save_prediction(lottery_type, code, predictions, play_type)
 
 
 def get_prediction_records(lottery_type: str = None) -> list:
-    if PREDICTION_RECORDS_FILE.exists():
-        try:
-            df = _read_csv_file(PREDICTION_RECORDS_FILE, dtype={"code": str, "compared": str, "compare_result": str})
-            df = df.dropna(subset=['lottery_type'])
-            records = []
-            for _, row in df.iterrows():
-                compare_result = None
-                cr_val = row.get('compare_result')
-                if cr_val and not pd.isna(cr_val):
-                    try:
-                        compare_result = json.loads(str(cr_val).strip())
-                    except Exception:
-                        compare_result = None
-                
-                predictions_str = row.get('predictions', '')
-                predictions = json.loads(predictions_str) if predictions_str and not pd.isna(predictions_str) else []
-                
-                play_type_val = row.get('play_type', '')
-                play_type = '' if pd.isna(play_type_val) else str(play_type_val)
-                
-                record = {
-                    'lottery_type': row['lottery_type'],
-                    'code': str(row['code']),
-                    'predictions': predictions,
-                    'play_type': play_type,
-                    'predict_time': row['predict_time'],
-                    'compared': str(row['compared']).lower() == 'true',
-                    'compare_result': compare_result
-                }
-                records.append(record)
-            if lottery_type:
-                return [r for r in records if r.get('lottery_type') == lottery_type]
-            return records
-        except Exception:
-            return []
-    return []
+    """读取预测记录（委托数据库模块）。"""
+    return _db_get_prediction_records(lottery_type)
 
 
 def get_prediction_for_code(lottery_type: str, code: str) -> dict:
-    records = get_prediction_records(lottery_type)
-    for record in records:
-        if record.get('code') == code:
-            return record
-    return None
+    """获取指定期号的预测记录（委托数据库模块）。"""
+    return _db_get_prediction_for_code(lottery_type, code)
 
 
 def update_prediction_compare(lottery_type: str, code: str, compare_result: dict):
-    if PREDICTION_RECORDS_FILE.exists():
-        try:
-            df = _read_csv_file(PREDICTION_RECORDS_FILE, dtype={"code": str, "compared": str, "compare_result": str})
-            df['compared'] = df['compared'].astype(str)
-            df['compare_result'] = df['compare_result'].astype(str)
-            mask = (df['lottery_type'] == lottery_type) & (df['code'] == code)
-            if mask.any():
-                df.loc[mask, 'compared'] = 'true'
-                df.loc[mask, 'compare_result'] = json.dumps(compare_result, ensure_ascii=False, default=lambda x: int(x) if isinstance(x, (int, float, np.integer, np.floating)) else bool(x) if isinstance(x, (bool, np.bool_)) else x)
-                df.to_csv(PREDICTION_RECORDS_FILE, index=False, encoding='utf-8-sig')
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
+    """更新预测对比结果（委托数据库模块）。"""
+    _db_update_prediction_compare(lottery_type, code, compare_result)
 
 
-def analyze_saved_predictions(lottery_type: str) -> dict:
+def analyze_saved_predictions(lottery_type: str, target_code: str = None) -> dict:
     df = _read_lottery_data(lottery_type)
     if df.empty:
         return {'error': '暂无历史数据'}
@@ -2127,47 +2351,74 @@ def analyze_saved_predictions(lottery_type: str) -> dict:
     latest_code = str(latest.get('code', ''))
     latest_date = latest.get('date', '')
     
-    record = get_prediction_for_code(lottery_type, latest_code)
+    available_codes = [str(r['code']) for r in records]
     
-    if not record:
-        next_code = str(int(latest_code) + 1)
-        record = get_prediction_for_code(lottery_type, next_code)
-        
+    if target_code:
+        target_code = str(target_code)
+        record = get_prediction_for_code(lottery_type, target_code)
         if not record:
             return {
-                'latest': {
-                    'code': latest_code,
-                    'date': latest_date
-                },
-                'error': '暂无该期的预测记录',
-                'available_codes': [r['code'] for r in records]
+                'latest': {'code': latest_code, 'date': latest_date},
+                'error': f'未找到第 {target_code} 期的预测记录',
+                'available_codes': available_codes
             }
+    else:
+        record = get_prediction_for_code(lottery_type, latest_code)
+        if not record:
+            next_code = str(int(latest_code) + 1)
+            record = get_prediction_for_code(lottery_type, next_code)
+            
+            if not record:
+                return {
+                    'latest': {'code': latest_code, 'date': latest_date},
+                    'error': '暂无该期的预测记录',
+                    'available_codes': available_codes
+                }
     
-    if int(record['code']) > int(latest_code):
+    record_code = str(record['code'])
+    
+    # 在开奖数据中查找对应期号
+    draw = None
+    if 'code' in df.columns:
+        draw_match = df[df['code'].astype(str) == record_code]
+        if not draw_match.empty:
+            draw = draw_match.iloc[0]
+    
+    if draw is None:
         return {
-            'latest': {
-                'code': latest_code,
-                'date': latest_date
-            },
-            'error': f'预测期号 {record["code"]} 尚未开奖（最新开奖期号：{latest_code}），请等待开奖后再对比',
-            'available_codes': [r['code'] for r in records]
+            'latest': {'code': latest_code, 'date': latest_date},
+            'error': f'第 {record_code} 期尚未开奖（最新开奖期号：{latest_code}），请等待开奖后再对比',
+            'available_codes': available_codes
         }
     
-    if record.get('compared'):
-        return record['compare_result']
+    if record.get('compared') and record.get('compare_result'):
+        cached = record['compare_result']
+        # 命中缓存时确保返回的 actual 与当前选中的开奖期一致
+        if str(cached.get('latest', {}).get('code', '')) == record_code:
+            return cached
     
+    draw_date = draw.get('date', '')
     actual_nums = []
     if lottery_type == 'ssq':
         actual_nums = {
-            'reds': [latest['r1'], latest['r2'], latest['r3'], 
-                     latest['r4'], latest['r5'], latest['r6']],
-            'blue': latest['blue']
+            'reds': [draw['r1'], draw['r2'], draw['r3'],
+                     draw['r4'], draw['r5'], draw['r6']],
+            'blue': draw['blue']
         }
     elif lottery_type == 'kl8':
         cols = [f'n{i:02d}' for i in range(1, 21)]
-        actual_nums = {'nums': [latest[col] for col in cols if col in latest]}
+        actual_nums = {'nums': [draw[col] for col in cols if col in draw]}
+    elif lottery_type == 'dlt':
+        actual_nums = {
+            'fronts': [draw['f1'], draw['f2'], draw['f3'],
+                       draw['f4'], draw['f5']],
+            'backs': [draw['b1'], draw['b2']]
+        }
+    elif lottery_type == 'qxc':
+        actual_nums = {'nums': [draw[f'n{i}'] for i in range(1, 8)]}
     else:
-        actual_nums = {'nums': [latest['n1'], latest['n2'], latest['n3']]}
+        # fcsd / pl3 共用 n1,n2,n3
+        actual_nums = {'nums': [draw['n1'], draw['n2'], draw['n3']]}
     
     predictions = record.get('predictions', [])
     best_match = None
@@ -2193,6 +2444,28 @@ def analyze_saved_predictions(lottery_type: str) -> dict:
                     'nums': pred
                 }
     
+    elif lottery_type == 'dlt':
+        best_match = {
+            'group': 0,
+            'front_matches': 0,
+            'back_matches': 0,
+            'nums': []
+        }
+        for i, pred in enumerate(predictions, 1):
+            nums = pred.get('nums', [])
+            # 大乐透保存格式: nums = [前区5个 + 后区2个]
+            fronts = nums[:5] if len(nums) >= 5 else []
+            backs = nums[5:] if len(nums) > 5 else []
+            front_match = len(set(fronts) & set(actual_nums['fronts']))
+            back_match = len(set(backs) & set(actual_nums['backs']))
+            if (front_match + back_match) > (best_match['front_matches'] + best_match['back_matches']):
+                best_match = {
+                    'group': i,
+                    'front_matches': front_match,
+                    'back_matches': back_match,
+                    'nums': nums
+                }
+    
     elif lottery_type == 'kl8':
         best_match = {
             'group': 0,
@@ -2209,7 +2482,27 @@ def analyze_saved_predictions(lottery_type: str) -> dict:
                     'nums': nums
                 }
     
+    elif lottery_type == 'qxc':
+        best_match = {
+            'group': 0,
+            'matches': 0,
+            'nums': []
+        }
+        for i, pred in enumerate(predictions, 1):
+            nums = pred.get('nums', [])
+            match_count = 0
+            for j in range(min(len(nums), 7)):
+                if nums[j] == actual_nums['nums'][j]:
+                    match_count += 1
+            if match_count > best_match['matches']:
+                best_match = {
+                    'group': i,
+                    'matches': match_count,
+                    'nums': nums
+                }
+    
     else:
+        # fcsd / pl3
         best_match = {
             'group': 0,
             'matches': 0,
@@ -2230,8 +2523,8 @@ def analyze_saved_predictions(lottery_type: str) -> dict:
     
     compare_result = {
         'latest': {
-            'code': latest_code,
-            'date': latest_date,
+            'code': record_code,
+            'date': draw_date,
             **actual_nums
         },
         'ai_best': best_match,
@@ -2239,7 +2532,7 @@ def analyze_saved_predictions(lottery_type: str) -> dict:
         'prize_result': calculate_total_prize(lottery_type, predictions, actual_nums)
     }
     
-    update_prediction_compare(lottery_type, record['code'], compare_result)
+    update_prediction_compare(lottery_type, record_code, compare_result)
     
     return compare_result
 
@@ -2335,6 +2628,62 @@ def calculate_fcsd_prize(pred_nums, actual_nums, play_type="straight"):
     return {"name": "未中奖", "prize": 0, "desc": ""}
 
 
+DLT_PRIZES = {
+    9: {"name": "一等奖", "prize": 10000000, "desc": "5+2（浮动奖金，参考值）"},
+    8: {"name": "二等奖", "prize": 500000, "desc": "5+1（浮动奖金，参考值）"},
+    7: {"name": "三等奖", "prize": 10000, "desc": "5+0/4+2"},
+    6: {"name": "四等奖", "prize": 3000, "desc": "4+1/3+2"},
+    5: {"name": "五等奖", "prize": 300, "desc": "4+0/3+1/2+2"},
+    4: {"name": "六等奖", "prize": 200, "desc": "3+0/1+2/2+1"},
+    3: {"name": "七等奖", "prize": 100, "desc": "2+0/1+1/0+2"},
+}
+
+
+def calculate_dlt_prize(fronts_pred, backs_pred, fronts_actual, backs_actual):
+    front_match = len(set(fronts_pred) & set(fronts_actual))
+    back_match = len(set(backs_pred) & set(backs_actual))
+    level = front_match * 1 + back_match * 1  # rough level
+    # 精确奖级判定
+    if front_match == 5 and back_match == 2:
+        level = 9
+    elif front_match == 5 and back_match == 1:
+        level = 8
+    elif (front_match == 5 and back_match == 0) or (front_match == 4 and back_match == 2):
+        level = 7
+    elif (front_match == 4 and back_match == 1) or (front_match == 3 and back_match == 2):
+        level = 6
+    elif (front_match == 4 and back_match == 0) or (front_match == 3 and back_match == 1) or (front_match == 2 and back_match == 2):
+        level = 5
+    elif (front_match == 3 and back_match == 0) or (front_match == 1 and back_match == 2) or (front_match == 2 and back_match == 1):
+        level = 4
+    elif (front_match == 2 and back_match == 0) or (front_match == 1 and back_match == 1) or (front_match == 0 and back_match == 2):
+        level = 3
+    else:
+        return {"name": "未中奖", "prize": 0, "desc": ""}
+    return DLT_PRIZES.get(level, {"name": "未中奖", "prize": 0, "desc": ""})
+
+
+def calculate_qxc_prize(pred_nums, actual_nums):
+    """七星彩：7 位逐位对比，全中一等奖，6 位二等奖，依次递减"""
+    matches = sum(1 for p, a in zip(pred_nums, actual_nums) if p == a)
+    if matches == 7:
+        return {"name": "一等奖", "prize": 5000000, "desc": "7 位全中（浮动奖金，参考值）"}
+    elif matches == 6:
+        return {"name": "二等奖", "prize": 5000, "desc": "6 位中"}
+    elif matches == 5:
+        return {"name": "三等奖", "prize": 500, "desc": "5 位中"}
+    elif matches == 4:
+        return {"name": "四等奖", "prize": 50, "desc": "4 位中"}
+    elif matches == 3:
+        return {"name": "五等奖", "prize": 5, "desc": "3 位中"}
+    return {"name": "未中奖", "prize": 0, "desc": ""}
+
+
+def calculate_pl3_prize(pred_nums, actual_nums, play_type="straight"):
+    """排列三奖级计算（与福彩3D一致）"""
+    return calculate_fcsd_prize(pred_nums, actual_nums, play_type)
+
+
 def calculate_total_prize(lottery_type, predictions, actual_nums, play_type=None):
     total_prize = 0
     total_cost = len(predictions) * 2
@@ -2345,11 +2694,24 @@ def calculate_total_prize(lottery_type, predictions, actual_nums, play_type=None
             reds = pred.get("red", [])
             blue = pred.get("blue", 0)
             prize_info = calculate_ssq_prize(reds, blue, actual_nums.get("reds", []), actual_nums.get("blue", 0))
+        elif lottery_type == "dlt":
+            nums = pred.get("nums", [])
+            fronts = nums[:5] if len(nums) >= 5 else nums
+            backs = nums[5:] if len(nums) > 5 else []
+            prize_info = calculate_dlt_prize(fronts, backs, actual_nums.get("fronts", []), actual_nums.get("backs", []))
         elif lottery_type == "kl8":
             nums = pred.get("nums", [])
             pt = play_type or "pick10"
             prize_info = calculate_kl8_prize(nums, actual_nums.get("nums", []), pt)
+        elif lottery_type == "qxc":
+            nums = pred.get("nums", [])
+            prize_info = calculate_qxc_prize(nums, actual_nums.get("nums", []))
+        elif lottery_type == "pl3":
+            nums = pred.get("nums", [])
+            pt = play_type if play_type else None
+            prize_info = calculate_pl3_prize(nums, actual_nums.get("nums", []), pt)
         else:
+            # fcsd
             nums = pred.get("nums", [])
             pt = play_type if play_type else None
             prize_info = calculate_fcsd_prize(nums, actual_nums.get("nums", []), pt)
@@ -2430,3 +2792,89 @@ def get_betting_report(lottery_type: str = None) -> dict:
         "profit_rate": (total_profit / total_cost * 100) if total_cost > 0 else 0,
         "records": detail_records
     }
+
+
+def ai_review_pool(lottery_type: str,
+                   candidate_pool: List[int],
+                   confidence: Dict[int, float],
+                   recent_stats: str = "",
+                   backtest_summary: str = "") -> dict:
+    """AI 候选池审阅：算法出候选号 + 统计摘要 → AI 审阅后标记优先/回避。
+
+    Args:
+        lottery_type: 彩种代码 (ssq/dlt/kl8/qxc/pl3/fcsd)
+        candidate_pool: 算法产出的候选号码列表
+        confidence: 号码→置信度映射
+        recent_stats: 近期统计摘要文本（可选）
+        backtest_summary: 回溯验证摘要文本（可选）
+
+    Returns:
+        dict: {
+            "prioritized": [号码...],   # AI 标记优先
+            "avoided": [号码...],       # AI 建议回避
+            "reasoning": "分析文本",    # AI 推理说明
+        }
+        AI 不可用时返回空标记（不阻断算法流程）。
+    """
+    if not is_ai_configured():
+        return {"prioritized": [], "avoided": [], "reasoning": "AI 未配置，跳过审阅"}
+
+    lottery_names = {
+        "ssq": "双色球", "dlt": "大乐透", "kl8": "快乐8",
+        "qxc": "七星彩", "pl3": "排列三", "fcsd": "福彩3D"
+    }
+    name = lottery_names.get(lottery_type, lottery_type)
+
+    # 构建候选号置信度排序
+    sorted_candidates = sorted(confidence.items(), key=lambda x: x[1], reverse=True)
+    pool_str = "、".join([f"{n}(置信度{c:.1%})" for n, c in sorted_candidates[:20]])
+
+    prompt = f"""你是一位精通概率统计的彩票数据分析顾问。请审阅以下由统计算法产出的候选号码池，给出优先/回避建议。
+
+【彩种】{name}
+【算法候选池 Top20】{pool_str}
+【近期统计概况】{recent_stats if recent_stats else "无"}
+【回溯验证】{backtest_summary if backtest_summary else "无"}
+
+【审阅规则】
+1. 你不是在"预测中奖号码"，而是基于统计特征对算法候选池做"增信/降权"微调
+2. 标记"优先"：近期遗漏回补信号强、区间分布偏冷需要轮动、置信度被低估的号码
+3. 标记"回避"：近期极热已过度释放、区间过度集中、连号/同尾数过多的号码
+4. 优先+回避总数不超过候选池的40%（保守微调，不颠覆算法结果）
+5. 每类至少1个，至多不超过候选池30%
+
+【输出格式】严格JSON，不要任何解释文字：
+{{
+  "prioritized": [号码1, 号码2, ...],
+  "avoided": [号码1, 号码2, ...],
+  "reasoning": "简短分析（100字以内）"
+}}"""
+
+    messages = [
+        {"role": "system", "content": "你是概率统计顾问，只基于数据做审阅，不预测中奖号码。输出严格JSON。"},
+        {"role": "user", "content": prompt}
+    ]
+
+    result = _call_ai(messages, max_tokens=800, temperature=0.3)
+    if "error" in result:
+        return {"prioritized": [], "avoided": [], "reasoning": f"AI 审阅失败: {result['error']}"}
+
+    try:
+        parsed = _safe_json_parse(result.get("result", ""))
+        if isinstance(parsed, dict):
+            prioritized = [int(x) for x in parsed.get("prioritized", []) if str(x).isdigit()]
+            avoided = [int(x) for x in parsed.get("avoided", []) if str(x).isdigit()]
+            reasoning = str(parsed.get("reasoning", ""))
+            # 安全过滤：只保留候选池中存在的号码
+            pool_set = set(candidate_pool)
+            prioritized = [n for n in prioritized if n in pool_set]
+            avoided = [n for n in avoided if n in pool_set]
+            return {
+                "prioritized": prioritized,
+                "avoided": avoided,
+                "reasoning": reasoning
+            }
+    except Exception as e:
+        pass
+
+    return {"prioritized": [], "avoided": [], "reasoning": "AI 返回解析失败，使用原算法结果"}

@@ -10,6 +10,12 @@ BASE_URL = "http://api.huiniao.top/interface/home/lotteryHistory"
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# 数据库管理模块（替代 CSV 直写）
+from db_manager import (
+    init_db, upsert_lottery_rows, read_lottery_data as _db_read_lottery,
+    get_known_codes, write_lottery_data,
+)
+
 
 def fetch_page(name: str, page_no: int, page_size: int = 30, retry=5) -> list[dict]:
     params = {
@@ -157,26 +163,26 @@ def parse_pl3(rows: list[dict]) -> pd.DataFrame:
 
 
 def update(name: str, force_full: bool = False) -> pd.DataFrame:
-    csv_path = os.path.join(DATA_DIR, f"{name}.csv")
-    old = pd.read_csv(csv_path, dtype={"code": str}) if os.path.exists(csv_path) else pd.DataFrame()
-    known = set(old["code"]) if not old.empty else set()
+    """从 API 同步数据到数据库。"""
+    init_db()
+    old = _db_read_lottery(name)
+    known = get_known_codes(name)
 
-    is_first_sync = not os.path.exists(csv_path)
-    
+    is_first_sync = len(known) == 0
+
     print(f"[{name}] 模式: {'全量同步' if (is_first_sync or force_full) else '增量同步'}")
-    print(f"[{name}] 本地文件存在: {os.path.exists(csv_path)}")
     print(f"[{name}] 本地已有期数: {len(known)}")
-    print(f"[{name}] API类型: {'klb' if name == 'kl8' else name}")
 
-    api_name_map = {"kl8": "klb", "pl3": "p3"}
+    api_name_map = {"kl8": "klb", "pl3": "pls"}
     api_name = api_name_map.get(name, name)
+    print(f"[{name}] API类型: {api_name}")
 
     all_new, page = [], 1
     stop_fetching = False
 
     while not stop_fetching:
         rows = fetch_page(api_name, page)
-        
+
         if not rows:
             break
 
@@ -195,10 +201,10 @@ def update(name: str, force_full: bool = False) -> pd.DataFrame:
                 break
 
         all_new.extend(new_rows_in_page)
-        
+
         if len(rows) < 30:
             break
-            
+
         page += 1
         time.sleep(0.8)
 
@@ -220,19 +226,21 @@ def update(name: str, force_full: bool = False) -> pd.DataFrame:
         else:
             df_new = pd.DataFrame()
 
-        df = pd.concat([df_new, old], ignore_index=True)
-        df = df.drop_duplicates(subset=["code"]).sort_values("code", ascending=False)
-        df.to_csv(csv_path, index=False)
-        
+        # 增量写入数据库
+        upsert_lottery_rows(name, df_new)
+
+        # 返回合并后的完整数据
+        df = _db_read_lottery(name)
+
         if len(df) > 0:
-            print(f"[{name}] ✅ 数据范围: {df.iloc[-1]['code']} ~ {df.iloc[0]['code']}")
-        
+            print(f"[{name}] ✅ 数据范围: {df.iloc[0]['code']} ~ {df.iloc[-1]['code']} (最新→最旧)")
+
         if is_first_sync or force_full:
             print(f"[{name}] 🎉 全量同步完成，共 {len(df)} 期")
         else:
             print(f"[{name}] 📊 增量更新：新增 {len(df_new)} 期，累计 {len(df)} 期")
         return df
-    
+
     if is_first_sync or force_full:
         print(f"[{name}] ✅ 已是最新，共 {len(old)} 期")
     else:
