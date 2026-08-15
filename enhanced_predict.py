@@ -1325,13 +1325,18 @@ class EnhancedPredictor:
         total_sets = len(all_sets)
         confidence = {k: round(v / total_sets, 4) for k, v in counter.items()}
 
-        # 生成推荐组（确定性选择，避免 random.shuffle 导致每次不同）
+        # 生成推荐组
         recommendations = []
         used = set()
         sorted_by_conf = sorted(confidence.items(), key=lambda x: x[1], reverse=True)
+        # 构建加权随机抽样的概率表（用于确定性窗口耗尽后的兜底）
+        _all_nums = [item[0] for item in sorted_by_conf]
+        _all_weights = [item[1] for item in sorted_by_conf]
+        _total_w = sum(_all_weights) or 1.0
+        _all_probs = [w / _total_w for w in _all_weights]
 
         for group_idx in range(n_groups):
-            # 从高置信度号码中确定性选取（偏移重试 + 剩余补充，保证足量且不重复）
+            # 阶段1：确定性滑动窗口（同一天结果稳定）
             candidates = [item[0] for item in sorted_by_conf[:sample_size * 3]]
             max_off = max(1, len(candidates) - sample_size + 1)
             chosen = None
@@ -1347,8 +1352,8 @@ class EnhancedPredictor:
                     used.add(nt)
                     chosen = nums
                     break
+            # 阶段2：从更靠后的置信度排序中取
             if chosen is None:
-                # 兜底：从更靠后的高置信度号码中取，避免位置制彩票(如七星彩)因号码池小导致重复不足
                 for extra in range(sample_size * 3, len(sorted_by_conf) - sample_size + 1):
                     nums = sorted([item[0] for item in sorted_by_conf[extra:extra + sample_size]])
                     nt = tuple(nums)
@@ -1356,7 +1361,33 @@ class EnhancedPredictor:
                         used.add(nt)
                         chosen = nums
                         break
+            # 阶段3：加权随机抽样兜底（解决双色球/大乐透因窗口数有限导致组数不足的问题）
             if chosen is None:
+                _random_tries = min(500, n_groups * 50)
+                for _rt in range(_random_tries):
+                    sampled = sorted(set(random.choices(
+                        population=_all_nums, weights=_all_probs, k=sample_size * 2)))
+                    if len(sampled) >= sample_size:
+                        nums = sampled[:sample_size]
+                    elif len(sampled) < sample_size:
+                        # 补足差额
+                        _need = sample_size - len(sampled)
+                        _pool = [n for n in _all_nums if n not in sampled]
+                        if _pool:
+                            nums = sorted(sampled + random.sample(_pool, min(_need, len(_pool))))
+                        else:
+                            continue
+                    else:
+                        nums = sampled
+                    if len(nums) != sample_size:
+                        continue
+                    nt = tuple(nums)
+                    if nt not in used:
+                        used.add(nt)
+                        chosen = nums
+                        break
+            if chosen is None:
+                # 确实无法生成更多不重复组合（号码池极小）
                 break
             avg_conf = sum(confidence.get(n, 0) for n in chosen) / len(chosen)
             if self.lottery_type == "ssq":
@@ -1620,8 +1651,14 @@ def _apply_ai_review(lottery_type: str, ensemble_result: Dict,
     # 非位置制：用调整后置信度重新选号
     new_recommendations = []
     used = set()
+    # 加权随机抽样概率表（用于确定性窗口耗尽后的兜底）
+    _adj_nums = [item[0] for item in sorted_adj]
+    _adj_weights = [item[1] for item in sorted_adj]
+    _adj_total_w = sum(_adj_weights) or 1.0
+    _adj_probs = [w / _adj_total_w for w in _adj_weights]
 
     for group_idx in range(n_groups):
+        # 阶段1：确定性滑动窗口
         candidates = [item[0] for item in sorted_adj[:sample_size * 3]]
         max_off = max(1, len(candidates) - sample_size + 1)
         chosen = None
@@ -1637,9 +1674,34 @@ def _apply_ai_review(lottery_type: str, ensemble_result: Dict,
                 used.add(nt)
                 chosen = nums
                 break
+        # 阶段2：从更靠后的置信度排序中取
         if chosen is None:
             for extra in range(sample_size * 3, len(sorted_adj) - sample_size + 1):
                 nums = sorted([item[0] for item in sorted_adj[extra:extra + sample_size]])
+                nt = tuple(nums)
+                if nt not in used:
+                    used.add(nt)
+                    chosen = nums
+                    break
+        # 阶段3：加权随机抽样兜底
+        if chosen is None:
+            _random_tries = min(500, n_groups * 50)
+            for _rt in range(_random_tries):
+                sampled = sorted(set(random.choices(
+                    population=_adj_nums, weights=_adj_probs, k=sample_size * 2)))
+                if len(sampled) >= sample_size:
+                    nums = sampled[:sample_size]
+                elif len(sampled) < sample_size:
+                    _need = sample_size - len(sampled)
+                    _pool = [n for n in _adj_nums if n not in sampled]
+                    if _pool:
+                        nums = sorted(sampled + random.sample(_pool, min(_need, len(_pool))))
+                    else:
+                        continue
+                else:
+                    nums = sampled
+                if len(nums) != sample_size:
+                    continue
                 nt = tuple(nums)
                 if nt not in used:
                     used.add(nt)

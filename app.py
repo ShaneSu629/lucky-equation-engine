@@ -67,6 +67,7 @@ from ai_predict import (
     is_ai_configured,
     save_prediction_record,
     analyze_saved_predictions,
+    refresh_all_prediction_compares,
     get_prediction_records,
     get_betting_report,
     load_config
@@ -531,7 +532,7 @@ def _render_sports_hedge():
 
     with col_input:
         st.write("### 💰 第一步：输入你的投注配置")
-        dlt_bets = st.number_input("核心：大乐透单期计划投注（注数）", min_value=1, max_value=50, value=10)
+        dlt_bets = st.number_input("核心：大乐透单期计划投注（注数）", min_value=1, max_value=100, value=10)
         dlt_cost = dlt_bets * 2
         st.markdown(f"🔴 **大乐透主投注额：** **{dlt_cost} 元**")
 
@@ -738,7 +739,7 @@ def _render_welfare_hedge():
     
     with col_input:
         st.write("### 💰 第一步：输入你的投注配置")
-        ssq_bets = st.number_input("核心：双色球单期计划投注（注数）", min_value=1, max_value=50, value=10)
+        ssq_bets = st.number_input("核心：双色球单期计划投注（注数）", min_value=1, max_value=100, value=10)
         ssq_cost = ssq_bets * 2
         st.markdown(f"🔴 **双色球主投注额：** **{ssq_cost} 元**")
         
@@ -1189,10 +1190,17 @@ elif selected_page == "dashboard":
                 key=f"compare_code_{current_name}",
                 help="选择后点击下方的对比按钮，即可查看该期预测与实际开奖的对照结果。"
             )
-            if st.button("🔍 对比已保存的预测记录与实际开奖", type="primary", width="stretch"):
+            btn_col1, btn_col2 = st.columns(2)
+            with btn_col1:
+                run_compare = st.button("🔍 对比已保存的预测记录与实际开奖", type="primary", width="stretch")
+            with btn_col2:
+                force_compare = st.button("🔄 强制重新对比（按最新规则刷新本期）", width="stretch",
+                                          help="忽略缓存，按当前最新中奖规则重新计算本期奖金")
+            
+            if run_compare or force_compare:
                 with st.spinner("正在分析已保存的预测记录与实际开奖的对比..."):
                     try:
-                        compare_result = analyze_saved_predictions(current_name, selected_code)
+                        compare_result = analyze_saved_predictions(current_name, selected_code, force_refresh=force_compare)
                         
                         if "error" in compare_result:
                             st.error(compare_result["error"])
@@ -1286,6 +1294,22 @@ elif selected_page == "dashboard":
         # ===== 投注报表 =====
         st.write("---")
         st.subheader("💰 AI 投注报表")
+        
+        if st.button("🔄 重新计算全部历史对比", key=f"refresh_all_compares_{current_name}",
+                     help="按最新中奖规则，强制刷新该彩种所有已对比历史记录的奖金/盈亏"):
+            with st.spinner("正在按最新规则刷新全部历史对比，请稍候..."):
+                try:
+                    refresh_result = refresh_all_prediction_compares(current_name)
+                    _msg = (f"✅ 刷新完成：成功 {refresh_result['success']} 期，"
+                            f"跳过 {refresh_result['skipped']} 期，失败 {refresh_result['errors']} 期")
+                    _toast_save(_msg)
+                    if refresh_result['errors'] > 0:
+                        for d in refresh_result['details'][-5:]:
+                            if '失败' in d:
+                                st.caption(d)
+                except Exception as _e:
+                    logger.error(f"[重新计算全部历史对比] 失败: {_e}", exc_info=True)
+                    _toast_error(f"刷新失败: {_e}")
         
         report = get_betting_report(current_name)
         
@@ -1391,7 +1415,7 @@ elif selected_page == "predict":
     
     col_cnt, _ = st.columns([2, 4])
     with col_cnt:
-        n_groups = st.slider("每种彩票生成组数", min_value=1, max_value=10, value=5)
+        n_groups = st.number_input("每种彩票生成组数", min_value=1, max_value=100, value=5, step=1)
     
     # ===== AI 智能预测（按顶部大类动态显示对应彩种）=====
     if is_ai_configured():
@@ -1711,36 +1735,43 @@ elif selected_page == "predict":
         st.markdown("### 🧬 集成预测（贝叶斯融合 + 蒙特卡洛 + 马尔可夫链三路投票）")
         st.info("🔬 **算法原理**：对历史数据进行**指数衰减加权**、**马尔可夫转移矩阵**、**遗漏回补概率**、**贝叶斯融合**四维建模后，通过 **10,000 次蒙特卡洛模拟** 投票选出高置信度号码。同时校验 AC值、跨度、012路、质合比、尾数等数学约束。")
         
-        col_ens_type, col_ens_cnt = st.columns([2, 3])
-        with col_ens_type:
-            current_name = st.session_state.get('selected_lottery', 'ssq')
-            lot_display = {
-                "ssq": "双色球", "kl8": "快乐8", "fcsd": "福彩3D",
-                "dlt": "大乐透", "qxc": "七星彩", "pl3": "排列三"
-            }
-            st.info(f"当前彩种：**{lot_display.get(current_name, current_name)}**（顶部切换大类 / 左侧选择具体彩种）")
-        with col_ens_cnt:
-            ensemble_n = st.slider("生成组数", 1, 10, 5, key="ensemble_n")
+        # 使用 st.form 包裹参数与运行按钮，确保用户手动输入的组数在点击时已被提交
+        with st.form("ensemble_form", clear_on_submit=False):
+            col_ens_type, col_ens_cnt = st.columns([2, 3])
+            with col_ens_type:
+                current_name = st.session_state.get('selected_lottery', 'ssq')
+                lot_display = {
+                    "ssq": "双色球", "kl8": "快乐8", "fcsd": "福彩3D",
+                    "dlt": "大乐透", "qxc": "七星彩", "pl3": "排列三"
+                }
+                st.info(f"当前彩种：**{lot_display.get(current_name, current_name)}**（顶部切换大类 / 左侧选择具体彩种）")
+            with col_ens_cnt:
+                ensemble_n = st.number_input(
+                    "生成组数", min_value=1, max_value=100, value=5, step=1, key="ensemble_n",
+                    help="直接输入数字后点击下方运行按钮即可生效"
+                )
 
-        # 快乐8玩法选择（仅快乐8时显示）
-        _ens_kl8_pick_size = 10
-        if current_name == "kl8":
-            _kl8_ens_options = {"选十 (10个号)": 10, "选九 (9个号)": 9, "选八 (8个号)": 8,
-                                "选七 (7个号)": 7, "选六 (6个号)": 6, "选五 (5个号)": 5,
-                                "选四 (4个号)": 4, "选三 (3个号)": 3, "选二 (2个号)": 2, "选一 (1个号)": 1}
-            _kl8_ens_sel = st.selectbox("快乐8玩法", list(_kl8_ens_options.keys()),
-                                        index=0, key="kl8_ens_play_type",
-                                        help="快乐8可选选一~选十，选十最主流")
-            _ens_kl8_pick_size = _kl8_ens_options[_kl8_ens_sel]
+            # 快乐8玩法选择（仅快乐8时显示）
+            _ens_kl8_pick_size = 10
+            if current_name == "kl8":
+                _kl8_ens_options = {"选十 (10个号)": 10, "选九 (9个号)": 9, "选八 (8个号)": 8,
+                                    "选七 (7个号)": 7, "选六 (6个号)": 6, "选五 (5个号)": 5,
+                                    "选四 (4个号)": 4, "选三 (3个号)": 3, "选二 (2个号)": 2, "选一 (1个号)": 1}
+                _kl8_ens_sel = st.selectbox("快乐8玩法", list(_kl8_ens_options.keys()),
+                                            index=0, key="kl8_ens_play_type",
+                                            help="快乐8可选选一~选十，选十最主流")
+                _ens_kl8_pick_size = _kl8_ens_options[_kl8_ens_sel]
 
-        # AI 候选池审阅开关
-        _use_ai_review = is_ai_configured() and st.checkbox(
-            "🤖 AI 候选池审阅", value=True,
-            help="开启后，AI 将审阅算法候选池，标记优先/回避号码，微调置信度后重新生成推荐",
-            key="chk_ai_review"
-        )
+            # AI 候选池审阅开关
+            _use_ai_review = is_ai_configured() and st.checkbox(
+                "🤖 AI 候选池审阅", value=True,
+                help="开启后，AI 将审阅算法候选池，标记优先/回避号码，微调置信度后重新生成推荐",
+                key="chk_ai_review"
+            )
 
-        if st.button("🧬 运行集成预测", type="primary", width="stretch", key="btn_ensemble"):
+            submitted = st.form_submit_button("🧬 运行集成预测", type="primary")
+
+        if submitted:
             spinner_msg = "🧬 正在运行四维建模 + 10,000次蒙特卡洛模拟..."
             if _use_ai_review:
                 spinner_msg = "🧬 算法建模 → 🤖 AI 审阅候选池 → 生成推荐..."
@@ -2060,7 +2091,7 @@ elif selected_page == "ai":
     # AI 参数设置
     col_ai_cnt, col_ai_type = st.columns([2, 3])
     with col_ai_cnt:
-        ai_n_groups = st.slider("AI 生成组数", min_value=1, max_value=20, value=5)
+        ai_n_groups = st.number_input("AI 生成组数", min_value=1, max_value=100, value=5, step=1)
     with col_ai_type:
         cur_lot = st.session_state.get('selected_lottery', 'ssq')
         lot_display = {
@@ -2193,7 +2224,7 @@ elif selected_page == "ai":
     
     col_hedge_ssq, col_hedge_kl8 = st.columns(2)
     with col_hedge_ssq:
-        ssq_bets_opt = st.number_input("双色球计划投注（注数）", min_value=1, max_value=50, value=10)
+        ssq_bets_opt = st.number_input("双色球计划投注（注数）", min_value=1, max_value=100, value=10)
     with col_hedge_kl8:
         hedge_strategy_opt = st.selectbox(
             "选择对冲方案",

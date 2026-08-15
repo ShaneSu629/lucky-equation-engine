@@ -2338,7 +2338,7 @@ def update_prediction_compare(lottery_type: str, code: str, compare_result: dict
     _db_update_prediction_compare(lottery_type, code, compare_result)
 
 
-def analyze_saved_predictions(lottery_type: str, target_code: str = None) -> dict:
+def analyze_saved_predictions(lottery_type: str, target_code: str = None, force_refresh: bool = False) -> dict:
     df = _read_lottery_data(lottery_type)
     if df.empty:
         return {'error': '暂无历史数据'}
@@ -2391,7 +2391,7 @@ def analyze_saved_predictions(lottery_type: str, target_code: str = None) -> dic
             'available_codes': available_codes
         }
     
-    if record.get('compared') and record.get('compare_result'):
+    if not force_refresh and record.get('compared') and record.get('compare_result'):
         cached = record['compare_result']
         # 命中缓存时确保返回的 actual 与当前选中的开奖期一致
         if str(cached.get('latest', {}).get('code', '')) == record_code:
@@ -2537,6 +2537,52 @@ def analyze_saved_predictions(lottery_type: str, target_code: str = None) -> dic
     return compare_result
 
 
+def refresh_all_prediction_compares(lottery_type: str) -> dict:
+    """强制重新对比指定彩种的所有已保存预测记录（按最新中奖规则刷新奖金）。
+
+    跳过尚未开奖的期号；已开奖但对比失败的期号会记录到 errors。
+
+    Returns:
+        {"success": int, "skipped": int, "errors": int, "details": list}
+    """
+    logger.info(f"[refresh_all] 开始强制刷新全量对比: lottery_type={lottery_type}")
+    records = get_prediction_records(lottery_type)
+    if not records:
+        logger.info("[refresh_all] 无预测记录，跳过")
+        return {"success": 0, "skipped": 0, "errors": 0, "details": ["无预测记录"]}
+
+    df = _read_lottery_data(lottery_type)
+    if df.empty:
+        logger.warning("[refresh_all] 无历史开奖数据")
+        return {"success": 0, "skipped": 0, "errors": 1, "details": ["无历史开奖数据"]}
+
+    available_codes = set(df['code'].astype(str).tolist())
+
+    success = 0
+    skipped = 0
+    errors = 0
+    details = []
+
+    for record in records:
+        code = str(record.get('code', ''))
+        if not code or code not in available_codes:
+            skipped += 1
+            details.append(f"第 {code or '?'} 期：尚未开奖，跳过")
+            continue
+        try:
+            analyze_saved_predictions(lottery_type, target_code=code, force_refresh=True)
+            success += 1
+            details.append(f"第 {code} 期：已刷新")
+            logger.debug(f"[refresh_all] 第 {code} 期刷新成功")
+        except Exception as e:
+            errors += 1
+            details.append(f"第 {code} 期：失败 {e}")
+            logger.error(f"[refresh_all] 第 {code} 期刷新失败: {e}", exc_info=True)
+
+    logger.info(f"[refresh_all] 完成: success={success}, skipped={skipped}, errors={errors}")
+    return {"success": success, "skipped": skipped, "errors": errors, "details": details}
+
+
 SSQ_PRIZES = {
     7: {"name": "一等奖", "prize": 5000000, "desc": "6+1（浮动奖金，参考值）"},
     6: {"name": "二等奖", "prize": 500000, "desc": "6+0（浮动奖金，参考值）"},
@@ -2547,17 +2593,19 @@ SSQ_PRIZES = {
 }
 
 
+# 快乐8 官方单注固定奖金（每注2元）。key = 精确命中数；key=0 表示「全不中」奖（仅命中0个才中）。
+# 数据来源：中国福利彩票官网开奖公告（选十中九=8000、全不中=2 等）。
 KL8_PRIZES = {
-    "pick1": {1: {"name": "一等奖", "prize": 4.6}},
-    "pick2": {2: {"name": "一等奖", "prize": 46}, 0: {"name": "中零奖", "prize": 4}},
-    "pick3": {3: {"name": "一等奖", "prize": 360}, 0: {"name": "中零奖", "prize": 3}},
-    "pick4": {4: {"name": "一等奖", "prize": 2400}, 3: {"name": "二等奖", "prize": 20}, 0: {"name": "中零奖", "prize": 2}},
-    "pick5": {5: {"name": "一等奖", "prize": 10000}, 4: {"name": "二等奖", "prize": 50}, 3: {"name": "三等奖", "prize": 5}, 0: {"name": "中零奖", "prize": 1}},
-    "pick6": {6: {"name": "一等奖", "prize": 50000}, 5: {"name": "二等奖", "prize": 300}, 4: {"name": "三等奖", "prize": 10}, 0: {"name": "中零奖", "prize": 1}},
-    "pick7": {7: {"name": "一等奖", "prize": 200000}, 6: {"name": "二等奖", "prize": 1000}, 5: {"name": "三等奖", "prize": 30}, 0: {"name": "中零奖", "prize": 1}},
-    "pick8": {8: {"name": "一等奖", "prize": 500000}, 7: {"name": "二等奖", "prize": 5000}, 6: {"name": "三等奖", "prize": 100}, 5: {"name": "四等奖", "prize": 5}, 0: {"name": "中零奖", "prize": 1}},
-    "pick9": {9: {"name": "一等奖", "prize": 1000000}, 8: {"name": "二等奖", "prize": 20000}, 7: {"name": "三等奖", "prize": 500}, 6: {"name": "四等奖", "prize": 20}, 0: {"name": "中零奖", "prize": 1}},
-    "pick10": {10: {"name": "一等奖", "prize": 5000000}, 9: {"name": "二等奖", "prize": 100000}, 8: {"name": "三等奖", "prize": 2000}, 7: {"name": "四等奖", "prize": 50}, 6: {"name": "五等奖", "prize": 5}, 5: {"name": "六等奖", "prize": 10}, 0: {"name": "中零奖", "prize": 10}}
+    "pick1":  {1: {"name": "选一中一",   "prize": 4.5}},
+    "pick2":  {2: {"name": "选二中二",   "prize": 19}, 0: {"name": "选二全不中", "prize": 2}},
+    "pick3":  {3: {"name": "选三中三",   "prize": 52}, 2: {"name": "选三中二", "prize": 3}, 0: {"name": "选三全不中", "prize": 2}},
+    "pick4":  {4: {"name": "选四中四",   "prize": 93}, 3: {"name": "选四中三", "prize": 5}, 2: {"name": "选四中二", "prize": 3}, 0: {"name": "选四全不中", "prize": 2}},
+    "pick5":  {5: {"name": "选五中五",   "prize": 1000}, 4: {"name": "选五中四", "prize": 20}, 3: {"name": "选五中三", "prize": 3}, 0: {"name": "选五全不中", "prize": 2}},
+    "pick6":  {6: {"name": "选六中六",   "prize": 2880}, 5: {"name": "选六中五", "prize": 30}, 4: {"name": "选六中四", "prize": 10}, 3: {"name": "选六中三", "prize": 3}, 0: {"name": "选六全不中", "prize": 2}},
+    "pick7":  {7: {"name": "选七中七",   "prize": 8500}, 6: {"name": "选七中六", "prize": 300}, 5: {"name": "选七中五", "prize": 30}, 4: {"name": "选七中四", "prize": 4}, 0: {"name": "选七全不中", "prize": 2}},
+    "pick8":  {8: {"name": "选八中八",   "prize": 50000}, 7: {"name": "选八中七", "prize": 800}, 6: {"name": "选八中六", "prize": 80}, 5: {"name": "选八中五", "prize": 10}, 4: {"name": "选八中四", "prize": 3}, 0: {"name": "选八全不中", "prize": 2}},
+    "pick9":  {9: {"name": "选九中九",   "prize": 250000}, 8: {"name": "选九中八", "prize": 2000}, 7: {"name": "选九中七", "prize": 225}, 6: {"name": "选九中六", "prize": 22}, 5: {"name": "选九中五", "prize": 5}, 4: {"name": "选九中四", "prize": 3}, 0: {"name": "选九全不中", "prize": 2}},
+    "pick10": {10: {"name": "选十中十",  "prize": 5000000}, 9: {"name": "选十中九", "prize": 8000}, 8: {"name": "选十中八", "prize": 720}, 7: {"name": "选十中七", "prize": 80}, 6: {"name": "选十中六", "prize": 5}, 5: {"name": "选十中五", "prize": 3}, 0: {"name": "选十全不中", "prize": 2}},
 }
 
 
@@ -2590,12 +2638,13 @@ def calculate_ssq_prize(reds_pred, blue_pred, reds_actual, blue_actual):
 
 def calculate_kl8_prize(pred_nums, actual_nums, play_type="pick10"):
     match_count = len(set(pred_nums) & set(actual_nums))
-    
+
     prizes = KL8_PRIZES.get(play_type, {})
-    for matched in sorted(prizes.keys(), reverse=True):
-        if match_count >= matched:
-            return prizes[matched]
-    
+    # 快乐8 各玩法按「精确命中数」定奖：命中数恰好等于某奖级 key 才中奖；
+    # key=0 仅代表「全不中」（命中0个）奖，不能把「中1个」误判为中奖。
+    if match_count in prizes:
+        return prizes[match_count]
+
     return {"name": "未中奖", "prize": 0, "desc": ""}
 
 
@@ -2628,54 +2677,76 @@ def calculate_fcsd_prize(pred_nums, actual_nums, play_type="straight"):
     return {"name": "未中奖", "prize": 0, "desc": ""}
 
 
+# 超级大乐透官方奖级（前区5+后区2）。数据来源：中国体彩网。
+# 一等奖5+2 / 二等奖5+1（均为浮动奖，参考值）/ 三等奖5+0=10000 / 四等奖4+2=3000
+# 五等奖4+1=300 / 六等奖3+2=200 / 七等奖4+0=100 / 八等奖3+1或2+2=15
+# 九等奖3+0或2+1或1+2或0+2=5。注意：2+0、1+1、1+0、0+1、0+0 均不中奖。
 DLT_PRIZES = {
     9: {"name": "一等奖", "prize": 10000000, "desc": "5+2（浮动奖金，参考值）"},
     8: {"name": "二等奖", "prize": 500000, "desc": "5+1（浮动奖金，参考值）"},
-    7: {"name": "三等奖", "prize": 10000, "desc": "5+0/4+2"},
-    6: {"name": "四等奖", "prize": 3000, "desc": "4+1/3+2"},
-    5: {"name": "五等奖", "prize": 300, "desc": "4+0/3+1/2+2"},
-    4: {"name": "六等奖", "prize": 200, "desc": "3+0/1+2/2+1"},
-    3: {"name": "七等奖", "prize": 100, "desc": "2+0/1+1/0+2"},
+    7: {"name": "三等奖", "prize": 10000, "desc": "5+0"},
+    6: {"name": "四等奖", "prize": 3000, "desc": "4+2"},
+    5: {"name": "五等奖", "prize": 300, "desc": "4+1"},
+    4: {"name": "六等奖", "prize": 200, "desc": "3+2"},
+    3: {"name": "七等奖", "prize": 100, "desc": "4+0"},
+    2: {"name": "八等奖", "prize": 15, "desc": "3+1/2+2"},
+    1: {"name": "九等奖", "prize": 5, "desc": "3+0/2+1/1+2/0+2"},
 }
 
 
 def calculate_dlt_prize(fronts_pred, backs_pred, fronts_actual, backs_actual):
     front_match = len(set(fronts_pred) & set(fronts_actual))
     back_match = len(set(backs_pred) & set(backs_actual))
-    level = front_match * 1 + back_match * 1  # rough level
-    # 精确奖级判定
+    # 官方大乐透中奖规则（严格按 前区命中数 + 后区命中数 组合判定）
     if front_match == 5 and back_match == 2:
         level = 9
     elif front_match == 5 and back_match == 1:
         level = 8
-    elif (front_match == 5 and back_match == 0) or (front_match == 4 and back_match == 2):
+    elif front_match == 5 and back_match == 0:
         level = 7
-    elif (front_match == 4 and back_match == 1) or (front_match == 3 and back_match == 2):
+    elif front_match == 4 and back_match == 2:
         level = 6
-    elif (front_match == 4 and back_match == 0) or (front_match == 3 and back_match == 1) or (front_match == 2 and back_match == 2):
+    elif front_match == 4 and back_match == 1:
         level = 5
-    elif (front_match == 3 and back_match == 0) or (front_match == 1 and back_match == 2) or (front_match == 2 and back_match == 1):
+    elif front_match == 3 and back_match == 2:
         level = 4
-    elif (front_match == 2 and back_match == 0) or (front_match == 1 and back_match == 1) or (front_match == 0 and back_match == 2):
+    elif front_match == 4 and back_match == 0:
         level = 3
+    elif (front_match == 3 and back_match == 1) or (front_match == 2 and back_match == 2):
+        level = 2
+    elif (front_match == 3 and back_match == 0) or (front_match == 2 and back_match == 1) \
+            or (front_match == 1 and back_match == 2) or (front_match == 0 and back_match == 2):
+        level = 1
     else:
         return {"name": "未中奖", "prize": 0, "desc": ""}
     return DLT_PRIZES.get(level, {"name": "未中奖", "prize": 0, "desc": ""})
 
 
 def calculate_qxc_prize(pred_nums, actual_nums):
-    """七星彩：7 位逐位对比，全中一等奖，6 位二等奖，依次递减"""
-    matches = sum(1 for p, a in zip(pred_nums, actual_nums) if p == a)
-    if matches == 7:
-        return {"name": "一等奖", "prize": 5000000, "desc": "7 位全中（浮动奖金，参考值）"}
-    elif matches == 6:
-        return {"name": "二等奖", "prize": 5000, "desc": "6 位中"}
-    elif matches == 5:
-        return {"name": "三等奖", "prize": 500, "desc": "5 位中"}
-    elif matches == 4:
-        return {"name": "四等奖", "prize": 50, "desc": "4 位中"}
-    elif matches == 3:
-        return {"name": "五等奖", "prize": 5, "desc": "3 位中"}
+    """七星彩：7 位逐位对位比较（官方规则，位置严格对应）。
+    一等奖 7位全中（浮动）；二等奖 前6位全中（浮动）；三等奖 前5+后1（5+1，3000）；
+    四等奖 任意5位中（500）；五等奖 任意4位中（30）；
+    六等奖 任意3位中 / 前6任1+后1 / 仅后1（5元）。
+    关键：三等奖要求「含后区」(5+1)，仅前6位中任意5位（不含后区）只算四等奖。
+    """
+    pred = list(pred_nums)
+    act = list(actual_nums)
+    front6_match = sum(1 for i in range(min(6, len(pred), len(act))) if pred[i] == act[i])
+    last_match = 1 if (len(pred) > 6 and len(act) > 6 and pred[6] == act[6]) else 0
+    total = front6_match + last_match
+
+    if front6_match == 6 and last_match == 1:
+        return {"name": "一等奖", "prize": 5000000, "desc": "7位全中（浮动奖金，参考值）"}
+    elif front6_match == 6 and last_match == 0:
+        return {"name": "二等奖", "prize": 0, "desc": "前6位全中（浮动奖金）"}
+    elif front6_match == 5 and last_match == 1:
+        return {"name": "三等奖", "prize": 3000, "desc": "前5位+后区（5+1）"}
+    elif total == 5:
+        return {"name": "四等奖", "prize": 500, "desc": "任意5位中"}
+    elif total == 4:
+        return {"name": "五等奖", "prize": 30, "desc": "任意4位中"}
+    elif total == 3 or (front6_match >= 1 and last_match == 1) or last_match == 1:
+        return {"name": "六等奖", "prize": 5, "desc": "任意3位中/仅后区中"}
     return {"name": "未中奖", "prize": 0, "desc": ""}
 
 
