@@ -11,8 +11,11 @@ AI 预测与分析模块
 import os
 import re
 import json
+import logging
 import pandas as pd
 import numpy as np
+
+logger = logging.getLogger(__name__)
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -1339,13 +1342,70 @@ def ai_analyze_trend(name: str) -> str:
 
 用通俗易懂的语言，200-400字。"""
 
+    elif name == "dlt":
+        recent_20 = df.head(20)
+        all_fronts = pd.concat([recent_20['f1'], recent_20['f2'], recent_20['f3'],
+                                recent_20['f4'], recent_20['f5']])
+        front_counts = all_fronts.value_counts()
+        back_counts = pd.concat([recent_20['b1'], recent_20['b2']]).value_counts()
+
+        latest = recent_20.iloc[0]
+
+        prompt = f"""请分析以下大乐透历史数据趋势，给出专业解读：
+
+【最近20期统计】
+- 最热前区TOP10: {front_counts.head(10).to_dict()}
+- 最冷前区BOTTOM5: {front_counts.tail(5).to_dict()}
+- 后区频次: {back_counts.to_dict()}
+
+【最新一期开奖】
+期号: {latest['code']}，日期: {latest['date']}
+前区: {latest['f1']} {latest['f2']} {latest['f3']} {latest['f4']} {latest['f5']}
+后区: {latest['b1']} {latest['b2']}
+
+请从以下角度分析：
+1. 近期热号、冷号趋势
+2. 奇偶比例变化
+3. 区间分布特征
+4. 后区走势
+5. 下期关注方向
+
+用通俗易懂的语言，200-400字。"""
+
+    elif name == "qxc":
+        recent_20 = df.head(20)
+        pos_cols = [f'n{i}' for i in range(1, 8)]
+        all_nums = pd.concat([recent_20[c] for c in pos_cols])
+        num_counts = all_nums.value_counts()
+        latest = recent_20.iloc[0]
+
+        prompt = f"""请分析以下七星彩历史数据趋势：
+
+【最近20期统计】
+- 最热号码TOP10: {num_counts.head(10).to_dict()}
+- 最冷号码BOTTOM5: {num_counts.tail(5).to_dict()}
+
+【最新一期开奖】
+期号: {latest['code']}，日期: {latest['date']}
+号码: {' '.join(str(latest[c]) for c in pos_cols)}
+
+请从以下角度分析：
+1. 各位冷热号趋势
+2. 奇偶、大小分布
+3. 下期关注方向
+
+用通俗易懂的语言，200-400字。"""
+
     else:
+        # fcsd / pl3 等三位玩法
         recent_20 = df.head(20)
         n1_counts = recent_20['n1'].value_counts().to_dict()
         n2_counts = recent_20['n2'].value_counts().to_dict()
         n3_counts = recent_20['n3'].value_counts().to_dict()
-        
-        prompt = f"""请分析以下福彩3D历史数据趋势：
+
+        lt_label = "福彩3D" if name == "fcsd" else "排列三"
+
+        prompt = f"""请分析以下{lt_label}历史数据趋势：
 
 【最近20期统计】
 - 百位频次: {n1_counts}
