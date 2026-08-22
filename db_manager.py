@@ -525,33 +525,131 @@ def get_prediction_records(lottery_type: str = None) -> list:
 
     records = []
     for _, row in df.iterrows():
-        compare_result = None
-        cr_val = row.get('compare_result', '')
-        if cr_val and not pd.isna(cr_val):
-            try:
-                compare_result = json.loads(str(cr_val).strip())
-            except Exception:
-                compare_result = None
-
-        predictions_str = row.get('predictions', '[]')
-        predictions = json.loads(predictions_str) if predictions_str and not pd.isna(predictions_str) else []
-
-        play_type_val = row.get('play_type', '')
-        play_type = '' if pd.isna(play_type_val) else str(play_type_val)
-
-        record = {
-            'lottery_type': row.get('lottery_type', ''),
-            'code': str(row.get('code', '')),
-            'predictions': predictions,
-            'play_type': play_type,
-            'predict_time': row.get('predict_time', ''),
-            'compared': str(row.get('compared', 'false')).lower() == 'true',
-            'compare_result': compare_result
-        }
-        records.append(record)
+        records.append(_parse_prediction_row(row))
 
     logger.info(f"读取预测记录: {lottery_type or '全部'} → {len(records)}条")
     return records
+
+
+def _parse_prediction_row(row) -> dict:
+    """将 predictions 表的一行（pandas Series）解析为 dict。"""
+    compare_result = None
+    cr_val = row.get('compare_result', '')
+    if cr_val and not pd.isna(cr_val):
+        try:
+            compare_result = json.loads(str(cr_val).strip())
+        except Exception:
+            compare_result = None
+
+    predictions_str = row.get('predictions', '[]')
+    predictions = json.loads(predictions_str) if predictions_str and not pd.isna(predictions_str) else []
+
+    play_type_val = row.get('play_type', '')
+    play_type = '' if pd.isna(play_type_val) else str(play_type_val)
+
+    return {
+        'lottery_type': row.get('lottery_type', ''),
+        'code': str(row.get('code', '')),
+        'predictions': predictions,
+        'play_type': play_type,
+        'predict_time': row.get('predict_time', ''),
+        'compared': str(row.get('compared', 'false')).lower() == 'true',
+        'compare_result': compare_result
+    }
+
+
+def _build_prediction_where(lottery_type: str,
+                            code_start=None, code_end=None,
+                            status: str = 'all', win: str = 'all'):
+    """构建预测记录筛选 WHERE 子句与参数（数据库级筛选）。
+
+    - code_start/code_end：按数字期号范围（CAST(code AS INTEGER)），空/None 表示不限制
+    - status: 'all' | 'compared' | 'pending'
+    - win:    'all' | 'won' | 'lost'（仅对已对比记录有效，用 JSON1 读取总奖金判断）
+    """
+    clauses = ["lottery_type = ?"]
+    params: list = [lottery_type]
+
+    if code_start is not None and str(code_start).strip() != "":
+        clauses.append("CAST(code AS INTEGER) >= ?")
+        params.append(int(str(code_start).strip()))
+    if code_end is not None and str(code_end).strip() != "":
+        clauses.append("CAST(code AS INTEGER) <= ?")
+        params.append(int(str(code_end).strip()))
+
+    if status == 'compared':
+        clauses.append("compared = 'true'")
+    elif status == 'pending':
+        clauses.append("compared = 'false'")
+
+    if win == 'won':
+        clauses.append(
+            "compared = 'true' AND compare_result <> '' "
+            "AND CAST(json_extract(compare_result, '$.prize_result.total_prize') AS REAL) > 0"
+        )
+    elif win == 'lost':
+        clauses.append(
+            "compared = 'true' AND compare_result <> '' "
+            "AND CAST(json_extract(compare_result, '$.prize_result.total_prize') AS REAL) = 0"
+        )
+
+    return " AND ".join(clauses), params
+
+
+def count_prediction_records(lottery_type: str,
+                             code_start=None, code_end=None,
+                             status: str = 'all', win: str = 'all') -> int:
+    """按筛选条件统计预测记录数量（用于分页总页数）。"""
+    init_db()
+    where, params = _build_prediction_where(lottery_type, code_start, code_end, status, win)
+    with get_connection() as conn:
+        try:
+            cur = conn.execute(f"SELECT COUNT(*) FROM predictions WHERE {where}", params)
+            return int(cur.fetchone()[0])
+        except Exception as e:
+            logger.error(f"统计预测记录失败: {e}")
+            return 0
+
+
+def get_prediction_records_paged(lottery_type: str, offset: int = 0, limit: int = 20,
+                                 code_start=None, code_end=None,
+                                 status: str = 'all', win: str = 'all') -> list:
+    """按筛选条件分页读取预测记录（数据库级 LIMIT/OFFSET，避免一次捞出全部）。
+
+    返回 list[dict]，结构与 get_prediction_records 一致。
+    """
+    init_db()
+    where, params = _build_prediction_where(lottery_type, code_start, code_end, status, win)
+    params = params + [int(limit), int(offset)]
+    with get_connection() as conn:
+        try:
+            df = pd.read_sql_query(
+                f"SELECT * FROM predictions WHERE {where} "
+                f"ORDER BY code DESC LIMIT ? OFFSET ?",
+                conn, params=params
+            )
+        except Exception as e:
+            logger.error(f"分页读取预测记录失败: {e}")
+            return []
+
+    records = [_parse_prediction_row(row) for _, row in df.iterrows()]
+    logger.info(f"分页读取预测记录: {lottery_type} offset={offset} limit={limit} → {len(records)}条")
+    return records
+
+
+def get_prediction_codes(lottery_type: str) -> list:
+    """只读 code 列，返回该彩种全部期号（降序），用于对比期号下拉框（轻量）。"""
+    init_db()
+    with get_connection() as conn:
+        try:
+            cur = conn.execute(
+                "SELECT code FROM predictions WHERE lottery_type=? ORDER BY code DESC",
+                (lottery_type,)
+            )
+            return [str(r[0]) for r in cur.fetchall()]
+        except Exception as e:
+            logger.error(f"读取预测期号失败: {e}")
+            return []
 
 
 def get_prediction_for_code(lottery_type: str, code: str) -> Optional[dict]:

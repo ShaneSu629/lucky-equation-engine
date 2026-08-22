@@ -1,0 +1,36 @@
+# ===== 彩票智能预测系统 - Docker Compose 部署 =====
+# 适用：飞牛OS(FnOS) Docker 应用 / 群晖 Container Manager / QNAP / 任何装了 Docker 的环境
+#
+# 飞牛OS 用法（Docker 图形界面，无需命令行）：
+#   1. 把整个 lottery_ui 目录上传到飞牛共享文件夹（如 docker/lottery_ui），并解压
+#   2. 把本机已填充的 data/lottery.db 也上传到 docker/lottery_ui/data/ 下（保留历史数据）
+#   3. 打开飞牛「Docker」应用 → 项目 → 新建项目，目录选 docker/lottery_ui，粘贴本文件
+#   4. 勾选「创建后启动」，等待构建完成（首次 pip 安装约几分钟）
+#   5. 浏览器访问： http://<飞牛内网IP>:8501
+#
+# 飞牛OS 用法（SSH 终端）：
+#   cd /vol1/1000/docker/lottery_ui   # 实际路径以你存放位置为准
+#   docker compose up -d --build
+#
+# 持久化说明：
+#   - ./data        -> /app/data        彩票数据库（含历史+预测记录），重建容器不丢
+#   - ./ai_config   -> /root/.lottery_ai  AI 接口配置（api_key 等），界面里填一次即可
+#   注意：首次部署若 ./data/lottery.db 不存在，容器会建空库，需在容器内跑
+#         python fetch_lottery.py 拉取历史数据（需 NAS 联网）
+
+services:
+  lottery-ui:
+    build: .
+    image: lottery-ui:latest
+    container_name: lottery-ui
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+      - ./ai_config:/root/.lottery_ai
+    environment:
+      - STREAMLIT_SERVER_HEADLESS=true
+      - STREAMLIT_BROWSER_GATHERUSAGESTATS=false
+    # 如需在公网访问，建议前方加反代 + 密码；此处仅暴露内网端口
+    # networks: 默认 bridge 即可，无需额外配置

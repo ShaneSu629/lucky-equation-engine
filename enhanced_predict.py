@@ -23,6 +23,9 @@ from typing import List, Tuple, Dict, Set, Optional
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# 模块可用性标志，供外部快速判断集成预测是否可用
+ENSEMBLE_AVAILABLE = True
+
 # ============================================================================
 # 第一部分：高级统计特征计算
 # ============================================================================

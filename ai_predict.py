@@ -170,21 +170,73 @@ def _call_ai(messages: list, max_tokens: int = 4000, temperature: float = 0.7) -
             max_tokens=max_tokens,
             temperature=temperature
         )
-        content = response.choices[0].message.content
-        return {"result": content}
+        choice = response.choices[0]
+        msg = choice.message
+        content = msg.content
+
+        # DeepSeek-R1 等推理模型：content 可能为 None/空，
+        # 推理内容在 reasoning_content 里；另外 finish_reason=stop 也有可能
+        # 只输出了推理但未生成最终回答（length 截断）
+        if not content or not str(content).strip():
+            # 尝试从 reasoning_content 恢复（部分 API 支持）
+            reasoning = getattr(msg, 'reasoning_content', None) or ''
+            if reasoning and str(reasoning).strip():
+                content = str(reasoning)
+            else:
+                # finish_reason=length 说明推理占满了 token，正式回答被截断
+                finish = getattr(choice, 'finish_reason', '')
+                if finish == 'length':
+                    return {"error": "AI 推理过长导致输出被截断，请减少组数或缩短 prompt 后重试"}
+                # 完全空响应
+                return {"error": "AI 返回空内容，可能是推理模型思考过长未生成正式回答，请重试"}
+
+        return {"result": str(content)}
     except Exception as e:
         return {"error": f"AI 调用失败: {str(e)}"}
+
+
+def _try_fix_and_load(candidate: str):
+    """尝试解析 JSON，失败时做常见容错修复再解析。"""
+    if not candidate:
+        return None
+    # 1) 直接解析
+    try:
+        return json.loads(candidate)
+    except Exception:
+        pass
+    # 2) 常见非法 JSON 修复：尾逗号 / NaN / Infinity / Python 布尔与 None
+    fixed = candidate
+    fixed = re.sub(r",\s*([}\]])", r"\1", fixed)          # 去掉 { 或 [ 前的尾逗号
+    fixed = re.sub(r"\bNaN\b", "null", fixed)
+    fixed = re.sub(r"\b(-?Infinity)\b", "null", fixed)
+    fixed = re.sub(r"\bTrue\b", "true", fixed)
+    fixed = re.sub(r"\bFalse\b", "false", fixed)
+    fixed = re.sub(r"\bNone\b", "null", fixed)
+    try:
+        return json.loads(fixed)
+    except Exception:
+        pass
+    # 3) 全单引号 -> 双引号（仅在原文本无双引号时尝试，避免误伤）
+    if '"' not in candidate:
+        try:
+            return json.loads(candidate.replace("'", '"'))
+        except Exception:
+            pass
+    return None
 
 
 def _safe_json_parse(text):
     """容错地从模型文本中提取 JSON 对象或数组。
 
-    依次尝试：直接解析 -> 剥离 ```json 代码围栏 -> 括号配平截取最外层 { } 或 [ ]。
+    依次尝试：直接解析 -> 剥离 <think> 推理块 -> 剥离 ```json 代码围栏
+    -> 括号配平截取最外层 { } 或 [ ]（含截断补全）。
     返回 dict/list，解析失败返回 None。
     """
     if not text or not isinstance(text, str):
         return None
     s = text.strip()
+    # 0) 剥离推理模型的 <think>...</think> 块（DeepSeek-R1 等）
+    s = re.sub(r"<think>[\s\S]*?</think>", "", s, flags=re.IGNORECASE).strip()
     # 1) 直接解析整段
     try:
         return json.loads(s)
@@ -194,18 +246,19 @@ def _safe_json_parse(text):
     fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", s, re.IGNORECASE)
     if fence:
         inner = fence.group(1).strip()
-        try:
-            return json.loads(inner)
-        except Exception:
-            s = inner
-    # 3) 括号配平：从最外层 { } 或 [ ] 截取后再解析（避免被正文里的花括号干扰）
-    for opener, closer in (("{", "}"), ("[", "]")):
+        parsed = _try_fix_and_load(inner)
+        if parsed is not None:
+            return parsed
+        s = inner
+    # 3) 括号配平：从最外层 { 或 [ 起，用完整括号栈截取（支持嵌套 + 截断补全）
+    for opener in ("{", "["):
         start = s.find(opener)
         if start == -1:
             continue
-        depth = 0
+        stack = []
         in_str = False
         esc = False
+        end = len(s)
         for i in range(start, len(s)):
             c = s[i]
             if esc:
@@ -219,16 +272,24 @@ def _safe_json_parse(text):
                 continue
             if in_str:
                 continue
-            if c == opener:
-                depth += 1
-            elif c == closer:
-                depth -= 1
-                if depth == 0:
-                    candidate = s[start:i + 1]
-                    try:
-                        return json.loads(candidate)
-                    except Exception:
+            if c in "{[":
+                stack.append(c)
+            elif c in "]}":
+                if stack and ((c == "}" and stack[-1] == "{") or (c == "]" and stack[-1] == "[")):
+                    stack.pop()
+                    if not stack:
+                        end = i + 1
                         break
+        candidate = s[start:end]
+        parsed = _try_fix_and_load(candidate)
+        if parsed is not None:
+            return parsed
+        # 截断补全：JSON 被 max_tokens 截断导致未闭合，按栈逆序补闭合括号再解析
+        if stack:
+            closers = "".join("}" if o == "{" else "]" for o in reversed(stack))
+            recovered = _try_fix_and_load(s[start:] + closers)
+            if recovered is not None:
+                return recovered
     return None
 
 
@@ -238,15 +299,28 @@ def _call_ai_json(messages, max_tokens=5000, temperature=0.5, retries=2):
     返回 (parsed, error)：成功时 error 为 None，失败时 parsed 为 None 且 error 为可读信息。
     """
     last_err = "AI 返回格式异常，请重试"
+    last_raw = ""
     for attempt in range(retries + 1):
         t = temperature if attempt == 0 else max(0.1, temperature - 0.2)
-        result = _call_ai(messages, max_tokens=max_tokens, temperature=t)
+        # 推理模型（DeepSeek-R1）重试时加大 max_tokens，避免推理占满配额
+        mt = max_tokens if attempt == 0 else max_tokens + 2000
+        result = _call_ai(messages, max_tokens=mt, temperature=t)
         if "error" in result:
+            # 空响应/截断等可恢复错误，继续重试而非直接返回
+            if attempt < retries:
+                last_raw = ""
+                logger.info(f"[_call_ai_json] attempt {attempt+1} 失败: {result['error']}，重试中...")
+                continue
             return None, result["error"]
-        parsed = _safe_json_parse(result.get("result", ""))
+        raw = result.get("result", "")
+        last_raw = raw
+        parsed = _safe_json_parse(raw)
         if parsed is not None:
             return parsed, None
-    return None, last_err
+    # 解析失败：记录原始返回，便于排查（日志 + 错误提示带片段）
+    logger.warning(f"[_call_ai_json] 解析失败，原始返回前300字: {last_raw[:300]!r}")
+    snippet = last_raw.strip()[:200].replace("\n", " ") if last_raw else "(空响应)"
+    return None, f"{last_err}。原始返回前200字：{snippet}"
 
 
 def _calculate_missing_periods(series, population):
@@ -666,7 +740,7 @@ def ai_predict_ssq(n_groups: int = 5) -> dict:
         {"role": "user", "content": prompt}
     ]
     
-    parsed, err = _call_ai_json(messages, max_tokens=5000, temperature=temperature)
+    parsed, err = _call_ai_json(messages, max_tokens=max(6000, n_groups * 90 + 3000), temperature=temperature)
     if err:
         return {"error": err}
     return parsed
@@ -824,7 +898,7 @@ def ai_predict_kl8(n_groups: int = 5, pick_size: int = 10) -> dict:
         {"role": "user", "content": prompt}
     ]
     
-    parsed, err = _call_ai_json(messages, max_tokens=5000, temperature=temperature)
+    parsed, err = _call_ai_json(messages, max_tokens=max(6000, n_groups * 90 + 3000), temperature=temperature)
     if err:
         return {"error": err}
     # 附带玩法信息
@@ -946,7 +1020,7 @@ def ai_predict_fcsd(n_groups: int = 5) -> dict:
         {"role": "user", "content": prompt}
     ]
     
-    parsed, err = _call_ai_json(messages, max_tokens=4000, temperature=temperature)
+    parsed, err = _call_ai_json(messages, max_tokens=max(6000, n_groups * 90 + 3000), temperature=temperature)
     if err:
         return {"error": err}
     return parsed
@@ -1075,7 +1149,7 @@ def ai_predict_dlt(n_groups: int = 5) -> dict:
         {"role": "user", "content": prompt}
     ]
     
-    parsed, err = _call_ai_json(messages, max_tokens=5000, temperature=temperature)
+    parsed, err = _call_ai_json(messages, max_tokens=max(6000, n_groups * 90 + 3000), temperature=temperature)
     if err:
         return {"error": err}
     return parsed
@@ -1168,7 +1242,7 @@ def ai_predict_qxc(n_groups: int = 5) -> dict:
         {"role": "user", "content": prompt}
     ]
     
-    parsed, err = _call_ai_json(messages, max_tokens=4000, temperature=temperature)
+    parsed, err = _call_ai_json(messages, max_tokens=max(6000, n_groups * 90 + 3000), temperature=temperature)
     if err:
         return {"error": err}
     return parsed
@@ -1280,7 +1354,7 @@ def ai_predict_pl3(n_groups: int = 5) -> dict:
         {"role": "user", "content": prompt}
     ]
     
-    parsed, err = _call_ai_json(messages, max_tokens=4000, temperature=temperature)
+    parsed, err = _call_ai_json(messages, max_tokens=max(6000, n_groups * 90 + 3000), temperature=temperature)
     if err:
         return {"error": err}
     return parsed
