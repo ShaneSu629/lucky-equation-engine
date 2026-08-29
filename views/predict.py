@@ -121,45 +121,10 @@ def render(current_name: str, cur_cat: str):
     """渲染预测页面。"""
     st.subheader("🎯 智能号码预测")
 
-    # 科学选号原理
-    cat_lots = LOT_CATS[cur_cat]['lots']
-    ratio_desc = {
-        "ssq": "双色球采用 3:2:1 比例组合",
-        "kl8": "快乐 8 选十采用 5:3:2 组合",
-        "fcsd": "福彩 3D 按位热温冷配比",
-        "dlt": "大乐透前区 3:2 搭配后区热温冷",
-        "qxc": "七星彩按位热温冷配比",
-        "pl3": "排列三按位热温冷配比",
-    }
-    ratio_text = "，".join(ratio_desc[l] for l in cat_lots if l in ratio_desc)
-    st.info(
-        f"💡 **科学选号原理（{LOT_CATS[cur_cat]['label']}）**："
-        f"根据自首发开奖至今的历史数据频次，自动划分为「热码」「温码」「冷码」。"
-        f"{ratio_text}，有效规避不平衡选号！"
-    )
-
-    # 生成组数
-    # 默认 15 组：2026-08-29 回测表明，组数增加只提高「至少中一次」的概率，
-    # 不改变每元期望回报（ROI 恒定），反而线性放大绝对亏损额。
-    # 15 组是覆盖度与成本的平衡点。
-    col_cnt, _ = st.columns([2, 4])
-    with col_cnt:
-        n_groups = st.number_input("每种彩票生成组数", min_value=1, max_value=100,
-                                   value=15, step=1)
-
-    # ===== Tab 分区 =====
-    tab_local, tab_ai, tab_ensemble = st.tabs(
-        ["🎲 本地算法", "🤖 AI 预测", "🔬 集成预测"]
-    )
-
-    with tab_local:
-        _render_local_predict(current_name, n_groups)
-
-    with tab_ai:
-        _render_ai_predict(current_name, n_groups, cur_cat)
-
-    with tab_ensemble:
-        _render_ensemble_predict(current_name, n_groups)
+    # 直接渲染集成预测（2026-08-29 精简）
+    # 原本地算法 tab 已被集成预测完整覆盖（贝叶斯/蒙特卡洛/马尔可夫/LSTM-CRF）
+    # 原 AI 预测 tab 实测号码有系统性偏差（χ² 显著偏离均匀），不比随机数更准
+    _render_ensemble_predict(current_name)
 
 
 def _render_local_predict(current_name: str, n_groups: int):
@@ -288,7 +253,7 @@ def _render_single_ai_panel(lot_key: str, n_groups: int):
                     )
 
 
-def _render_ensemble_predict(current_name: str, n_groups: int):
+def _render_ensemble_predict(current_name: str):
     """集成预测。"""
     try:
         from enhanced_predict import get_ensemble_prediction, ENSEMBLE_AVAILABLE
