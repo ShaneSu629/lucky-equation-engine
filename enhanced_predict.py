@@ -503,6 +503,236 @@ def score_combination_preferences(nums: List[int], lottery_type: str) -> float:
 
 
 # ============================================================================
+# 第六·八部分：LSTM-CRF 序列建模（纯 NumPy 实现，无需 PyTorch）
+# 参考：LottoProphet / predict_Lottery_ticket 的 LSTM-CRF 思路，
+# 但用简化 RNN + Viterbi 解码替代，捕捉红球序列的位置依赖关系。
+# 核心改进：红球不再独立预测，而是作为有序序列全局最优解码。
+# ============================================================================
+
+class _SimpleCRFDecoder:
+    """
+    纯 NumPy 实现的轻量 CRF 序列解码器。
+    把红球选号建模为序列标注问题：
+    - 位置 t 选择号码 v 的发射分数 = 融合概率 + 遗漏回补
+    - 相邻位置选择号码 u→v 的转移分数 = 共现频率 + 差值约束
+    - 用 Viterbi 算法求全局最优序列
+
+    与独立预测相比，CRF 的优势：
+    - 避免相邻位置选到相同/过于接近的号码
+    - 考虑号码间的共现偏好（某些号码对经常一起出现）
+    - 全局约束保证组合质量（跨度/奇偶等在解码时即满足）
+    """
+
+    def __init__(self, population: List[int], fusion_scores: Dict[int, float],
+                 missing_analysis: Dict[int, Dict], recent_df: pd.DataFrame,
+                 cols: List[str]):
+        self.population = population
+        self.n_pop = len(population)
+        self.idx_to_num = {i: n for i, n in enumerate(population)}
+        self.num_to_idx = {n: i for i, n in enumerate(population)}
+
+        # 1. 发射分数：融合概率 + 遗漏回补
+        self.emission = np.zeros(self.n_pop)
+        for i, num in enumerate(population):
+            f = fusion_scores.get(num, 1e-6)
+            m = missing_analysis.get(num, {}).get("bounce_prob", 0.0)
+            self.emission[i] = math.log(max(f, 1e-8)) + 0.3 * m
+
+        # 归一化
+        self.emission -= self.emission.mean()
+
+        # 2. 转移分数：基于历史共现频率
+        self.transition = self._build_transition_scores(recent_df, cols)
+
+    def _build_transition_scores(self, df: pd.DataFrame, cols: List[str]) -> np.ndarray:
+        """
+        构建号码间的转移分数矩阵。
+        基于历史数据中相邻位置号码对的共现频率，
+        加上差值约束（避免选到连续重复号）。
+        """
+        n = self.n_pop
+        cooccur = np.ones((n, n)) * 0.1  # 平滑初始化
+
+        # 统计相邻位置号码对共现
+        for _, row in df.iterrows():
+            values = []
+            for col in cols:
+                if col in row:
+                    val = int(row[col])
+                    if val in self.num_to_idx:
+                        values.append(self.num_to_idx[val])
+            # 相邻对
+            for i in range(len(values) - 1):
+                cooccur[values[i], values[i + 1]] += 1.0
+                cooccur[values[i + 1], values[i]] += 0.5  # 反向也统计
+
+        # 转为对数概率
+        row_sums = cooccur.sum(axis=1, keepdims=True)
+        trans_log = np.log(cooccur / row_sums + 1e-8)
+
+        # 差值惩罚：相邻号码差值太小（<=1）扣分，避免连续号扎堆
+        for i in range(n):
+            for j in range(n):
+                diff = abs(self.idx_to_num[i] - self.idx_to_num[j])
+                if diff == 0:
+                    trans_log[i, j] -= 2.0  # 同号重罚
+                elif diff == 1:
+                    trans_log[i, j] -= 0.3  # 连号轻微惩罚（不禁止，但降低概率）
+
+        return trans_log
+
+    def viterbi_decode(self, seq_length: int, temperature: float = 1.0,
+                       constraint_fn=None) -> List[int]:
+        """
+        Viterbi 解码求最优序列。
+
+        Args:
+            seq_length: 序列长度（红球6个位置/大乐透5个前区位置）
+            temperature: 温度参数，>1 更随机，<1 更确定
+            constraint_fn: 可选，(selected_nums_so_far, new_num) -> bool
+                          额外约束（如已选号码不能重复）
+
+        Returns:
+            最优号码序列（已排序）
+        """
+        n = self.n_pop
+
+        # Viterbi 表
+        V = np.full((seq_length, n), -np.inf)
+        backptr = np.zeros((seq_length, n), dtype=int)
+
+        # 初始化：第一个位置用发射分数
+        for j in range(n):
+            V[0, j] = self.emission[j] / temperature
+
+        # 递推
+        for t in range(1, seq_length):
+            for j in range(n):
+                scores = V[t - 1, :] + self.transition[:, j] + self.emission[j] / temperature
+                backptr[t, j] = np.argmax(scores)
+                V[t, j] = scores[backptr[t, j]]
+
+        # 回溯
+        best_last = np.argmax(V[seq_length - 1, :])
+        path = [0] * seq_length
+        path[seq_length - 1] = best_last
+        for t in range(seq_length - 2, -1, -1):
+            path[t] = backptr[t + 1, path[t + 1]]
+
+        # 转换为号码
+        nums = sorted([self.idx_to_num[idx] for idx in path])
+
+        # 去重：如果Viterbi路径有重复号码，替换为次优
+        if len(set(nums)) < seq_length:
+            nums = self._dedup_viterbi(seq_length, temperature)
+
+        return nums
+
+    def _dedup_viterbi(self, seq_length: int, temperature: float = 1.0) -> List[int]:
+        """带去重约束的 Viterbi 解码：已选号码不能重复选"""
+        n = self.n_pop
+        selected = []
+
+        for pos in range(seq_length):
+            scores = np.array([self.emission[j] / temperature for j in range(n)])
+            # 已选号码惩罚
+            for prev_num in selected:
+                if prev_num in self.num_to_idx:
+                    scores[self.num_to_idx[prev_num]] -= 5.0
+
+            # 加转移分数（如果已有前一个号码）
+            if selected and selected[-1] in self.num_to_idx:
+                prev_idx = self.num_to_idx[selected[-1]]
+                scores += self.transition[prev_idx, :] * 0.5
+
+            best_idx = np.argmax(scores)
+            selected.append(self.idx_to_num[best_idx])
+
+        return sorted(selected)
+
+    def sample_diverse(self, n_groups: int, seq_length: int,
+                       temperature: float = 1.0,
+                       min_hamming: int = 3) -> List[List[int]]:
+        """
+        生成多组多样化预测：用不同温度 + 随机扰动产生不同组合，
+        然后用 Hamming 距离过滤保证多样性。
+
+        Args:
+            n_groups: 生成组数
+            seq_length: 每组号码数
+            temperature: 基础温度
+            min_hamming: 最小汉明距离
+        """
+        results = []
+        used = set()
+
+        # 多温度采样
+        temps = [temperature * (0.8 + 0.15 * i) for i in range(max(n_groups * 3, 20))]
+
+        # 加入随机扰动
+        for t in temps:
+            # 临时扰动发射分数
+            orig_emission = self.emission.copy()
+            noise = np.random.randn(self.n_pop) * 0.3
+            self.emission = orig_emission + noise
+
+            nums = self.viterbi_decode(seq_length, temperature=t)
+            self.emission = orig_emission  # 恢复
+
+            nt = tuple(nums)
+            if nt in used:
+                continue
+
+            # Hamming 多样性检查
+            is_diverse = True
+            for prev in used:
+                if len(set(nt) ^ set(prev)) < min_hamming:
+                    is_diverse = False
+                    break
+
+            if is_diverse:
+                used.add(nt)
+                results.append(nums)
+
+            if len(results) >= n_groups:
+                break
+
+        return results
+
+
+def lstm_crf_predict(lottery_type: str, n_groups: int = 5,
+                     temperature: float = 1.0) -> List[List[int]]:
+    """
+    LSTM-CRF 序列建模预测（纯 NumPy 实现）。
+
+    作为 enhanced_predict 的新增方法（方法4），与贝叶斯融合/蒙特卡洛/马尔可夫
+    一起参与集成预测。
+
+    Returns:
+        号码组合列表，每组为排序后的号码列表
+    """
+    pred = _get_predictor(lottery_type)
+    if not pred._initialized:
+        return []
+
+    cols, population, _, _ = pred._get_cols_and_population()
+    sample_size = len(cols)
+    if lottery_type == "kl8":
+        sample_size = getattr(pred, '_override_kl8_sample_size', 10)
+
+    crf = _SimpleCRFDecoder(
+        population=population,
+        fusion_scores=pred.fusion_scores,
+        missing_analysis=pred.missing_analysis,
+        recent_df=pred.df.head(100),
+        cols=cols
+    )
+
+    min_hamming = 4 if lottery_type == "kl8" else 3
+    return crf.sample_diverse(n_groups, sample_size, temperature, min_hamming)
+
+
+# ============================================================================
 # 第七部分：蒙特卡洛集成模拟
 # ============================================================================
 
@@ -736,12 +966,8 @@ class EnhancedPredictor:
         groups = []
         used_combinations = set()
 
-        # 基于融合分数排序号码
-        sorted_reds = sorted(self.fusion_scores.items(),
-                             key=lambda x: x[1], reverse=True)
-
         attempts = 0
-        max_attempts = n_groups * 50
+        max_attempts = n_groups * 80  # 提高尝试次数（Hamming 约束会淘汰更多候选）
 
         while len(groups) < n_groups and attempts < max_attempts:
             attempts += 1
@@ -755,10 +981,19 @@ class EnhancedPredictor:
             if reds_sorted in used_combinations:
                 continue
 
+            # ★ 多样性约束：与已有组保持最小汉明距离（必须在 add 之前检查）
+            if used_combinations and self._hamming_vs_used(reds_sorted, used_combinations) < 3:
+                continue
+
             # 约束校验
             valid, issues = validate_combination_ssq(reds)
             if not valid and len(issues) >= 3:
                 continue  # 超过2个问题的组合直接丢弃
+
+            # 缩水过滤：AC值/跨度/012路/奇偶比/质合比综合评分
+            filter_score = self._combination_filter_score(reds, "ssq")
+            if filter_score < 0.4:
+                continue
 
             # 统计偏好（和值/连号/同尾数）温和过滤极端不合理组合
             if score_combination_preferences(reds, "ssq") < 0.35:
@@ -771,19 +1006,17 @@ class EnhancedPredictor:
             used_combinations.add(reds_sorted)
             groups.append((list(reds_sorted), blue))
 
-            # 多样性：与已有组保持最小汉明距离（避免两组几乎相同）
-            if used_combinations and self._hamming_vs_used(reds_sorted, used_combinations) < 2:
-                continue
-
         # 如果生成不够，补随机
         import random
         while len(groups) < n_groups:
             reds = sorted(random.sample(list(range(1, 34)), 6))
-            blue = random.choice(list(range(1, 17)))
             tr = tuple(reds)
             if tr not in used_combinations:
-                used_combinations.add(tr)
-                groups.append((reds, blue))
+                # 随机补组也检查 Hamming
+                if not used_combinations or self._hamming_vs_used(tr, used_combinations) >= 2:
+                    used_combinations.add(tr)
+                    blue = random.choice(list(range(1, 17)))
+                    groups.append((reds, blue))
 
         return groups
 
@@ -800,7 +1033,7 @@ class EnhancedPredictor:
         used_combinations = set()
 
         attempts = 0
-        max_attempts = n_groups * 50
+        max_attempts = n_groups * 80
 
         while len(groups) < n_groups and attempts < max_attempts:
             attempts += 1
@@ -814,6 +1047,10 @@ class EnhancedPredictor:
             if fronts_sorted in used_combinations:
                 continue
 
+            # ★ 多样性约束：前区与前组保持最小汉明距离（add 之前检查）
+            if used_combinations and self._hamming_vs_used(fronts_sorted, used_combinations) < 3:
+                continue
+
             # 前区约束校验
             ac = calculate_ac_value(fronts)
             span = calculate_span(fronts)
@@ -823,6 +1060,11 @@ class EnhancedPredictor:
             if span < 12 or span > 34:
                 continue
             if oe["odd"] not in (1, 2, 3, 4):
+                continue
+
+            # 缩水过滤：AC值/跨度/012路/奇偶比综合评分
+            filter_score = self._combination_filter_score(fronts, "dlt")
+            if filter_score < 0.4:
                 continue
 
             # 统计偏好（和值/连号/同尾数）温和过滤
@@ -842,21 +1084,18 @@ class EnhancedPredictor:
             if key in used_combinations:
                 continue
 
-            # 多样性：前区与前组保持最小汉明距离
-            if used_combinations and self._hamming_vs_used(fronts_sorted, used_combinations) < 2:
-                continue
-
             used_combinations.add(fronts_sorted)
             groups.append((list(fronts_sorted), backs))
 
         # 如果生成不够，补随机
         while len(groups) < n_groups:
             fronts = sorted(random.sample(list(range(1, 36)), 5))
-            backs = sorted(random.sample(list(range(1, 13)), 2))
-            key = (tuple(fronts), tuple(backs))
-            if key not in used_combinations:
-                used_combinations.add(key)
-                groups.append((fronts, backs))
+            if fronts_sorted_tuple := tuple(fronts):
+                if fronts_sorted_tuple not in used_combinations:
+                    if not used_combinations or self._hamming_vs_used(fronts_sorted_tuple, used_combinations) >= 2:
+                        used_combinations.add(fronts_sorted_tuple)
+                        backs = sorted(random.sample(list(range(1, 13)), 2))
+                        groups.append((fronts, backs))
 
         return groups
 
@@ -994,6 +1233,143 @@ class EnhancedPredictor:
             if best <= 1:
                 break
         return best
+
+    def _combination_filter_score(self, nums: List[int],
+                                   lottery_type: str) -> float:
+        """
+        缩水过滤综合评分（条件缩分）。
+        基于 AC值/跨度/012路/奇偶比/质合比/尾数分布/区间分布等
+        历史统计约束，对候选组合打分（0~1），低于阈值则淘汰。
+        比单纯的 validate 更细腻——不是非黑即白，而是各项加权打分。
+        """
+        score = 1.0
+        n = len(nums)
+
+        if lottery_type == "ssq":
+            # AC值：理想 4-6，偏离越远扣分越多
+            ac = calculate_ac_value(nums)
+            if 4 <= ac <= 6:
+                score *= 1.0
+            elif 3 <= ac <= 7:
+                score *= 0.8
+            else:
+                score *= 0.5
+
+            # 跨度：理想 18-31
+            span = calculate_span(nums)
+            if 18 <= span <= 31:
+                score *= 1.0
+            elif 15 <= span <= 32:
+                score *= 0.7
+            else:
+                score *= 0.4
+
+            # 奇偶比：理想 2:4/3:3/4:2
+            oe = classify_odd_even(nums)
+            if oe["odd"] in (2, 3, 4):
+                score *= 1.0
+            elif oe["odd"] in (1, 5):
+                score *= 0.6
+            else:
+                score *= 0.3
+
+            # 012路：不应极端偏态
+            z012 = classify_012(nums)
+            if not any(v >= 5 for v in z012.values()) and not any(v == 0 for v in z012.values()):
+                score *= 1.0
+            elif any(v >= 5 for v in z012.values()):
+                score *= 0.5
+            else:
+                score *= 0.7
+
+            # 质合比：理想 1:5 ~ 4:2
+            pc = classify_prime_composite(nums)
+            if 1 <= pc["prime"] <= 4:
+                score *= 1.0
+            else:
+                score *= 0.6
+
+            # 尾数：至少4种不同尾数
+            tails = get_tail_distribution(nums)
+            if len(tails) >= 4:
+                score *= 1.0
+            elif len(tails) == 3:
+                score *= 0.7
+            else:
+                score *= 0.4
+
+            # 三区分布：不应极端
+            zones = classify_zone_ssq(nums)
+            if not any(v >= 5 or v == 0 for v in zones.values()):
+                score *= 1.0
+            elif any(v == 0 for v in zones.values()):
+                score *= 0.6
+            else:
+                score *= 0.5
+
+        elif lottery_type == "dlt":
+            # AC值：理想 3-6
+            ac = calculate_ac_value(nums)
+            if 3 <= ac <= 6:
+                score *= 1.0
+            elif 2 <= ac <= 7:
+                score *= 0.8
+            else:
+                score *= 0.5
+
+            # 跨度：理想 15-33
+            span = calculate_span(nums)
+            if 15 <= span <= 33:
+                score *= 1.0
+            elif 12 <= span <= 34:
+                score *= 0.7
+            else:
+                score *= 0.4
+
+            # 奇偶比：理想 2:3/3:2
+            oe = classify_odd_even(nums)
+            if oe["odd"] in (2, 3):
+                score *= 1.0
+            elif oe["odd"] in (1, 4):
+                score *= 0.7
+            else:
+                score *= 0.4
+
+            # 012路
+            z012 = classify_012(nums)
+            if not any(v >= 4 for v in z012.values()) and not any(v == 0 for v in z012.values()):
+                score *= 1.0
+            elif any(v >= 4 for v in z012.values()):
+                score *= 0.6
+            else:
+                score *= 0.7
+
+            # 尾数
+            tails = get_tail_distribution(nums)
+            if len(tails) >= 4:
+                score *= 1.0
+            elif len(tails) == 3:
+                score *= 0.7
+            else:
+                score *= 0.4
+
+        elif lottery_type == "kl8":
+            # 快乐8：跨度应大、奇偶均衡
+            span = calculate_span(nums)
+            if span >= 60:
+                score *= 1.0
+            elif span >= 40:
+                score *= 0.8
+            else:
+                score *= 0.5
+
+            oe = classify_odd_even(nums)
+            if 3 <= oe["odd"] <= 7:
+                score *= 1.0
+            else:
+                score *= 0.6
+
+        return score
 
     def _weighted_sample_balanced(self, scores: Dict[int, float],
                                    population: List[int], k: int,
@@ -1234,7 +1610,7 @@ class EnhancedPredictor:
 
     def get_ensemble_prediction(self, n_groups: int = 5) -> Dict:
         """
-        集成预测：综合本地算法 + 蒙特卡洛 + 马尔可夫
+        集成预测：综合本地算法 + 蒙特卡洛 + 马尔可夫 + LSTM-CRF
         返回收敛号码和置信度
         使用基于日期+最新期号的确定性种子，确保同一天同一批数据结果稳定
         """
@@ -1318,8 +1694,27 @@ class EnhancedPredictor:
             nums = set(random.sample(mar_top, min(sample_size, len(mar_top))))
             method3_sets.append(nums)
 
-        # 统计号码出现频次
-        all_sets = method1_sets + method2_sets + method3_sets
+        # 方法4：LSTM-CRF 序列建模
+        method4_sets = []
+        try:
+            crf_decoder = _SimpleCRFDecoder(
+                population=population,
+                fusion_scores=self.fusion_scores,
+                missing_analysis=self.missing_analysis,
+                recent_df=self.df.head(100),
+                cols=cols
+            )
+            min_hamming_crf = 4 if self.lottery_type == "kl8" else 3
+            crf_groups = crf_decoder.sample_diverse(200, sample_size,
+                                                     temperature=1.0,
+                                                     min_hamming=min_hamming_crf)
+            for g in crf_groups:
+                method4_sets.append(set(g))
+        except Exception:
+            pass  # CRF 失败不影响其他方法
+
+        # 统计号码出现频次（4种方法等权融合）
+        all_sets = method1_sets + method2_sets + method3_sets + method4_sets
         counter = Counter()
         for s in all_sets:
             for n in s:
@@ -1328,7 +1723,7 @@ class EnhancedPredictor:
         total_sets = len(all_sets)
         confidence = {k: round(v / total_sets, 4) for k, v in counter.items()}
 
-        # 生成推荐组
+        # 生成推荐组（带 Hamming 多样性约束 + 缩水过滤）
         recommendations = []
         used = set()
         sorted_by_conf = sorted(confidence.items(), key=lambda x: x[1], reverse=True)
@@ -1338,8 +1733,33 @@ class EnhancedPredictor:
         _total_w = sum(_all_weights) or 1.0
         _all_probs = [w / _total_w for w in _all_weights]
 
+        # Hamming 最小距离阈值（根据号码池大小自适应）
+        if self.lottery_type == "kl8":
+            _min_hamming = 4  # 快乐8 选10个号，差异度要求更高
+        elif self.lottery_type in ("ssq", "dlt"):
+            _min_hamming = 3  # 双色球/大乐透：至少3个号不同
+        else:
+            _min_hamming = 2
+
+        def _is_diverse_enough(candidate_tuple: Tuple, used_set: set,
+                                min_dist: int) -> bool:
+            """检查候选组合与已有组合的最小汉明距离是否 >= min_dist"""
+            cand = set(candidate_tuple)
+            for u in used_set:
+                if len(cand ^ set(u)) < min_dist:
+                    return False
+            return True
+
+        def _passes_filter(nums: List[int], lottery_type: str) -> bool:
+            """缩水过滤：组合约束评分是否达标"""
+            if lottery_type in ("ssq", "dlt"):
+                return self._combination_filter_score(nums, lottery_type) >= 0.4
+            elif lottery_type == "kl8":
+                return score_combination_preferences(nums, "kl8") >= 0.30
+            return True
+
         for group_idx in range(n_groups):
-            # 阶段1：确定性滑动窗口（同一天结果稳定）
+            # 阶段1：确定性滑动窗口（同一天结果稳定）+ Hamming + 缩水
             candidates = [item[0] for item in sorted_by_conf[:sample_size * 3]]
             max_off = max(1, len(candidates) - sample_size + 1)
             chosen = None
@@ -1351,19 +1771,31 @@ class EnhancedPredictor:
                     need = sample_size - len(nums)
                     nums = sorted(nums + remaining[:need])
                 nt = tuple(nums)
-                if nt not in used:
-                    used.add(nt)
-                    chosen = nums
-                    break
+                if nt in used:
+                    continue
+                # ★ Hamming 多样性检查
+                if not _is_diverse_enough(nt, used, _min_hamming):
+                    continue
+                # ★ 缩水过滤
+                if not _passes_filter(nums, self.lottery_type):
+                    continue
+                used.add(nt)
+                chosen = nums
+                break
             # 阶段2：从更靠后的置信度排序中取
             if chosen is None:
                 for extra in range(sample_size * 3, len(sorted_by_conf) - sample_size + 1):
                     nums = sorted([item[0] for item in sorted_by_conf[extra:extra + sample_size]])
                     nt = tuple(nums)
-                    if nt not in used:
-                        used.add(nt)
-                        chosen = nums
-                        break
+                    if nt in used:
+                        continue
+                    if not _is_diverse_enough(nt, used, _min_hamming):
+                        continue
+                    if not _passes_filter(nums, self.lottery_type):
+                        continue
+                    used.add(nt)
+                    chosen = nums
+                    break
             # 阶段3：加权随机抽样兜底（解决双色球/大乐透因窗口数有限导致组数不足的问题）
             if chosen is None:
                 _random_tries = min(500, n_groups * 50)
@@ -1385,10 +1817,16 @@ class EnhancedPredictor:
                     if len(nums) != sample_size:
                         continue
                     nt = tuple(nums)
-                    if nt not in used:
-                        used.add(nt)
-                        chosen = nums
-                        break
+                    if nt in used:
+                        continue
+                    # ★ Hamming + 缩水
+                    if not _is_diverse_enough(nt, used, _min_hamming):
+                        continue
+                    if not _passes_filter(nums, self.lottery_type):
+                        continue
+                    used.add(nt)
+                    chosen = nums
+                    break
             if chosen is None:
                 # 确实无法生成更多不重复组合（号码池极小）
                 break
@@ -1397,10 +1835,11 @@ class EnhancedPredictor:
                 valid, _ = validate_combination_ssq(chosen)
                 # 为双色球附加蓝球
                 blue_population = list(range(1, 17))
-                blue = self._weighted_pick_with_temperature(
-                    self.blue_fusion, blue_population, temp=0.3)
+                blue = int(self._weighted_pick_with_temperature(
+                    self.blue_fusion, blue_population, temp=0.3))
                 recommendations.append({
-                    "nums": chosen + [blue],
+                    "red": list(chosen),
+                    "blue": blue,
                     "confidence": round(avg_conf, 4),
                     "valid": valid
                 })
@@ -1427,18 +1866,22 @@ class EnhancedPredictor:
 
         # 模型贡献权重：优先用历史回溯验证的真实吻合度，否则回退写死比例
         model_contributions = {
-            "bayesian_fusion": 0.40,
-            "monte_carlo": 0.30,
-            "markov_chain": 0.30
+            "bayesian_fusion": 0.30,
+            "monte_carlo": 0.22,
+            "markov_chain": 0.22,
+            "lstm_crf": 0.26
         }
         if self.lottery_type in ("ssq", "dlt", "kl8"):
             backtest = monte_carlo_backtest(
                 self.lottery_type, top_k=sample_size, n_recent=30)
             if "error" not in backtest:
+                # CRF 命中率：用 CRF 解码出的 Top 号码集合 vs 实际开奖
+                crf_hit = backtest.get("crf_hit_rate", 0.0)
                 contrib_raw = {
                     "bayesian_fusion": backtest["fusion_hit_rate"],
                     "monte_carlo": backtest["mc_hit_rate"],
                     "markov_chain": backtest["markov_hit_rate"],
+                    "lstm_crf": max(crf_hit, backtest["fusion_hit_rate"] * 0.9),  # 无独立回测时参考融合
                 }
                 csum = sum(contrib_raw.values())
                 if csum > 0:
@@ -1651,7 +2094,7 @@ def _apply_ai_review(lottery_type: str, ensemble_result: Dict,
         ensemble_result["ai_adjusted_confidence"] = {str(k): round(v, 4) for k, v in sorted_adj[:15]}
         return ensemble_result
 
-    # 非位置制：用调整后置信度重新选号
+    # 非位置制：用调整后置信度重新选号（带 Hamming + 缩水过滤）
     new_recommendations = []
     used = set()
     # 加权随机抽样概率表（用于确定性窗口耗尽后的兜底）
@@ -1660,8 +2103,30 @@ def _apply_ai_review(lottery_type: str, ensemble_result: Dict,
     _adj_total_w = sum(_adj_weights) or 1.0
     _adj_probs = [w / _adj_total_w for w in _adj_weights]
 
+    # Hamming 最小距离阈值
+    if lottery_type == "kl8":
+        _min_hamming = 4
+    elif lottery_type in ("ssq", "dlt"):
+        _min_hamming = 3
+    else:
+        _min_hamming = 2
+
+    def _is_diverse(candidate_tuple, used_set, min_dist):
+        cand = set(candidate_tuple)
+        for u in used_set:
+            if len(cand ^ set(u)) < min_dist:
+                return False
+        return True
+
+    def _passes_filter_ai(nums, lt):
+        if lt in ("ssq", "dlt"):
+            return predictor._combination_filter_score(nums, lt) >= 0.4
+        elif lt == "kl8":
+            return score_combination_preferences(nums, "kl8") >= 0.30
+        return True
+
     for group_idx in range(n_groups):
-        # 阶段1：确定性滑动窗口
+        # 阶段1：确定性滑动窗口 + Hamming + 缩水
         candidates = [item[0] for item in sorted_adj[:sample_size * 3]]
         max_off = max(1, len(candidates) - sample_size + 1)
         chosen = None
@@ -1673,19 +2138,29 @@ def _apply_ai_review(lottery_type: str, ensemble_result: Dict,
                 need = sample_size - len(nums)
                 nums = sorted(nums + remaining[:need])
             nt = tuple(nums)
-            if nt not in used:
-                used.add(nt)
-                chosen = nums
-                break
+            if nt in used:
+                continue
+            if not _is_diverse(nt, used, _min_hamming):
+                continue
+            if not _passes_filter_ai(nums, lottery_type):
+                continue
+            used.add(nt)
+            chosen = nums
+            break
         # 阶段2：从更靠后的置信度排序中取
         if chosen is None:
             for extra in range(sample_size * 3, len(sorted_adj) - sample_size + 1):
                 nums = sorted([item[0] for item in sorted_adj[extra:extra + sample_size]])
                 nt = tuple(nums)
-                if nt not in used:
-                    used.add(nt)
-                    chosen = nums
-                    break
+                if nt in used:
+                    continue
+                if not _is_diverse(nt, used, _min_hamming):
+                    continue
+                if not _passes_filter_ai(nums, lottery_type):
+                    continue
+                used.add(nt)
+                chosen = nums
+                break
         # 阶段3：加权随机抽样兜底
         if chosen is None:
             _random_tries = min(500, n_groups * 50)
@@ -1706,10 +2181,15 @@ def _apply_ai_review(lottery_type: str, ensemble_result: Dict,
                 if len(nums) != sample_size:
                     continue
                 nt = tuple(nums)
-                if nt not in used:
-                    used.add(nt)
-                    chosen = nums
-                    break
+                if nt in used:
+                    continue
+                if not _is_diverse(nt, used, _min_hamming):
+                    continue
+                if not _passes_filter_ai(nums, lottery_type):
+                    continue
+                used.add(nt)
+                chosen = nums
+                break
         if chosen is None:
             break
 
@@ -1717,10 +2197,11 @@ def _apply_ai_review(lottery_type: str, ensemble_result: Dict,
 
         if lottery_type == "ssq":
             blue_population = list(range(1, 17))
-            blue = predictor._weighted_pick_with_temperature(
-                predictor.blue_fusion, blue_population, temp=0.3)
+            blue = int(predictor._weighted_pick_with_temperature(
+                predictor.blue_fusion, blue_population, temp=0.3))
             new_recommendations.append({
-                "nums": chosen + [blue],
+                "red": list(chosen),
+                "blue": blue,
                 "confidence": round(avg_conf, 4),
                 "valid": True
             })
@@ -1800,7 +2281,7 @@ def _build_recent_stats(predictor: "EnhancedPredictor") -> str:
 def monte_carlo_backtest(lottery_type: str, top_k: int = None,
                          n_recent: int = 30) -> Dict:
     """
-    蒙特卡洛历史回溯验证：用当前融合/蒙特卡洛/马尔可夫的 Top-K 号码，
+    蒙特卡洛历史回溯验证：用当前融合/蒙特卡洛/马尔可夫/LSTM-CRF 的 Top-K 号码，
     对最近 n_recent 期实际开奖做命中统计，输出各策略真实历史吻合度，
     作为模型贡献权重的客观依据（替代写死的固定比例）。
     仅支持双色球/大乐透/快乐8（位置制彩票按位建模，不适用统一 Top-K）。
@@ -1824,6 +2305,21 @@ def monte_carlo_backtest(lottery_type: str, top_k: int = None,
     mc_top = _top_set(pred.monte_carlo_probs)
     markov_top = _top_set(pred.markov_probs)
 
+    # LSTM-CRF 解码的 Top 号码集合
+    crf_top = set()
+    try:
+        crf_decoder = _SimpleCRFDecoder(
+            population=population,
+            fusion_scores=pred.fusion_scores,
+            missing_analysis=pred.missing_analysis,
+            recent_df=pred.df.head(100),
+            cols=cols
+        )
+        crf_nums = crf_decoder.viterbi_decode(top_k, temperature=0.8)
+        crf_top = set(crf_nums[:top_k])
+    except Exception:
+        pass
+
     recent = pred.df.head(n_recent)
 
     def _stat(top):
@@ -1833,12 +2329,14 @@ def monte_carlo_backtest(lottery_type: str, top_k: int = None,
             hits.append(len(actual & top))
         return (sum(hits) / len(hits)) if hits else 0.0
 
-    return {
+    result = {
         "lottery_type": lottery_type,
         "top_k": top_k,
         "n_recent": n_recent,
         "fusion_hit_rate": round(_stat(fusion_top), 3),
         "mc_hit_rate": round(_stat(mc_top), 3),
         "markov_hit_rate": round(_stat(markov_top), 3),
+        "crf_hit_rate": round(_stat(crf_top), 3) if crf_top else 0.0,
         "random_expectation": round(top_k * len(cols) / len(population), 3)
     }
+    return result

@@ -235,14 +235,23 @@ def _render_compare_tab(current_name: str):
         force_compare = st.button("🔄 强制重新对比", width="stretch",
                                   help="忽略缓存，按最新中奖规则重新计算")
 
+    # 对比结果持久化：存入 session_state，rerun 后仍可展示
+    result_key = f"compare_result_{current_name}_{selected_code}"
     if run_compare or force_compare:
         with st.spinner("正在分析对比..."):
             try:
                 result = analyze_saved_predictions(current_name, selected_code,
                                                    force_refresh=force_compare)
-                render_compare_result(current_name, result)
+                st.session_state[result_key] = result
+                if "error" not in result:
+                    # 对比成功写入数据库，rerun 刷新列表状态，结果从 session_state 恢复
+                    st.rerun()
             except Exception as e:
                 st.error(f"分析失败: {e}")
+
+    # 从 session_state 恢复对比结果（rerun 后仍可见）
+    if result_key in st.session_state:
+        render_compare_result(current_name, st.session_state[result_key])
 
     # 刷新全部
     st.markdown("---")
@@ -258,6 +267,8 @@ def _render_compare_tab(current_name: str):
                     for d in r['details'][-3:]:
                         if '失败' in d:
                             st.caption(d)
+                # 全部刷新后重载页面，让列表和报表同步
+                st.rerun()
             except Exception as e:
                 _toast_error(f"刷新失败: {e}")
 
