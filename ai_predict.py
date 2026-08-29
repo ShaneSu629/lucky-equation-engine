@@ -212,6 +212,12 @@ def _try_fix_and_load(candidate: str):
     fixed = re.sub(r"\bTrue\b", "true", fixed)
     fixed = re.sub(r"\bFalse\b", "false", fixed)
     fixed = re.sub(r"\bNone\b", "null", fixed)
+    # 前导零（彩票场景高频）：JSON 不允许 05/07 这类数字，而模型看到
+    # 历史开奖格式（01 12 14 ...）后会模仿输出带前导零的号码，
+    # 导致 json.loads 直接抛错。仅处理数组内部，避免误伤字符串。
+    fixed = re.sub(r"\[[^\]]*\]",
+                   lambda m: re.sub(r"(?<![\w.])0+(\d+)", r"\1", m.group(0)),
+                   fixed)
     try:
         return json.loads(fixed)
     except Exception:
